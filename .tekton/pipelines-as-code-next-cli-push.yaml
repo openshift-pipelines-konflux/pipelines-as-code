@@ -12,14 +12,14 @@ metadata:
     pipelinesascode.tekton.dev/on-cel-expression: event == "push" && target_branch
       == "main" &&
       ("upstream/***".pathChanged() || ".konflux/patches/***".pathChanged() || ".konflux/rpms/***".pathChanged() ||
-      ".konflux/dockerfiles/webhook.Dockerfile".pathChanged() ||
-      ".tekton/pipelines-as-code-main-webhook-push.yaml".pathChanged())
+      ".konflux/dockerfiles/cli.Dockerfile".pathChanged() ||
+      ".tekton/pipelines-as-code-next-cli-push.yaml".pathChanged())
   creationTimestamp: null
   labels:
-    appstudio.openshift.io/application: openshift-pipelines-core-main
-    appstudio.openshift.io/component: pipelines-as-code-main-webhook
+    appstudio.openshift.io/application: openshift-pipelines-core-next
+    appstudio.openshift.io/component: pipelines-as-code-next-cli
     pipelines.appstudio.openshift.io/type: build
-  name: pipelines-as-code-main-webhook-on-push
+  name: pipelines-as-code-next-cli-on-push
   namespace: tekton-ecosystem-tenant
 spec:
   params:
@@ -28,16 +28,16 @@ spec:
   - name: revision
     value: '{{revision}}'
   - name: output-image
-    value: quay.io/redhat-user-workloads/tekton-ecosystem-tenant/pipelines-as-code-webhook-rhel9:{{revision}}
+    value: quay.io/redhat-user-workloads/tekton-ecosystem-tenant/pipelines-as-code-cli-rhel9:{{revision}}
   - name: dockerfile
-    value: .konflux/dockerfiles/webhook.Dockerfile
+    value: .konflux/dockerfiles/cli.Dockerfile
   - name: prefetch-input
     value: |
       {"type": "rpm", "path": ".konflux/rpms"}
   pipelineRef:
     name: docker-build-ta
   taskRunTemplate:
-    serviceAccountName: build-pipeline-pipelines-as-code-main-webhook
+    serviceAccountName: build-pipeline-pipelines-as-code-cli-next
   workspaces:
   - name: git-auth
     secret:
