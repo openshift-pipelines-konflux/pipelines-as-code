@@ -10,16 +10,16 @@ metadata:
     build.appstudio.redhat.com/target_branch: '{{target_branch}}'
     pipelinesascode.tekton.dev/max-keep-runs: "3"
     pipelinesascode.tekton.dev/on-cel-expression: event == "push" && target_branch
-      == "main" &&
+      == "release-v1.22.x" &&
       ("upstream/***".pathChanged() || ".konflux/patches/***".pathChanged() || ".konflux/rpms/***".pathChanged() ||
-      ".konflux/dockerfiles/watcher.Dockerfile".pathChanged() ||
-      ".tekton/pipelines-as-code-next-watcher-push.yaml".pathChanged())
+      ".konflux/dockerfiles/webhook.Dockerfile".pathChanged() ||
+      ".tekton/pipelines-as-code-1-22-webhook-push.yaml".pathChanged())
   creationTimestamp: null
   labels:
-    appstudio.openshift.io/application: openshift-pipelines-core-next
-    appstudio.openshift.io/component: pipelines-as-code-next-watcher
+    appstudio.openshift.io/application: openshift-pipelines-core-1-22
+    appstudio.openshift.io/component: pipelines-as-code-1-22-webhook
     pipelines.appstudio.openshift.io/type: build
-  name: pipelines-as-code-next-watcher-on-push
+  name: pipelines-as-code-1-22-webhook-on-push
   namespace: tekton-ecosystem-tenant
 spec:
   params:
@@ -28,16 +28,16 @@ spec:
   - name: revision
     value: '{{revision}}'
   - name: output-image
-    value: quay.io/redhat-user-workloads/tekton-ecosystem-tenant/pipelines-as-code-watcher-rhel9:{{revision}}
+    value: quay.io/redhat-user-workloads/tekton-ecosystem-tenant/pipelines-as-code-webhook-rhel9:{{revision}}
   - name: dockerfile
-    value: .konflux/dockerfiles/watcher.Dockerfile
+    value: .konflux/dockerfiles/webhook.Dockerfile
   - name: prefetch-input
     value: |
       {"type": "rpm", "path": ".konflux/rpms"}
   pipelineRef:
     name: docker-build-ta
   taskRunTemplate:
-    serviceAccountName: build-pipeline-pipelines-as-code-watcher-next
+    serviceAccountName: build-pipeline-pipelines-as-code-webhook-1-22
   workspaces:
   - name: git-auth
     secret:
