@@ -1,6 +1,7 @@
 package settings
 
 import (
+	"net/http"
 	"reflect"
 	"testing"
 
@@ -77,6 +78,7 @@ func TestSyncConfig(t *testing.T) {
 				"custom-console-url-namespace":            "https://custom-console-namespace",
 				"remember-ok-to-test":                     "false",
 				"skip-push-event-for-pr-commits":          "true",
+				"require-ok-to-test-sha":                  "true",
 			},
 			expectedStruct: Settings{
 				ApplicationName:                      "pac-pac",
@@ -107,6 +109,7 @@ func TestSyncConfig(t *testing.T) {
 				CustomConsolePRTaskLog:               "https://custom-console-pr-tasklog",
 				CustomConsoleNamespaceURL:            "https://custom-console-namespace",
 				RememberOKToTest:                     false,
+				RequireOkToTestSHA:                   true,
 			},
 		},
 		{
@@ -150,7 +153,7 @@ func TestSyncConfig(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			var test Settings
 
-			err := SyncConfig(logger, &test, tc.configMap, DefaultValidators())
+			err := SyncConfig(logger, &test, tc.configMap, DefaultValidators(), http.DefaultClient)
 
 			// set hub catalogs to nil to avoid comparison error
 			// test separately

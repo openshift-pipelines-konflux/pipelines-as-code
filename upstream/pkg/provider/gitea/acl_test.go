@@ -7,12 +7,12 @@ import (
 	"net/http"
 	"testing"
 
-	giteaStructs "code.gitea.io/gitea/modules/structs"
-	"code.gitea.io/sdk/gitea"
+	"codeberg.org/mvdkleijn/forgejo-sdk/forgejo/v3"
 	"github.com/openshift-pipelines/pipelines-as-code/pkg/apis/pipelinesascode/v1alpha1"
 	"github.com/openshift-pipelines/pipelines-as-code/pkg/params"
 	"github.com/openshift-pipelines/pipelines-as-code/pkg/params/info"
 	"github.com/openshift-pipelines/pipelines-as-code/pkg/params/settings"
+	"github.com/openshift-pipelines/pipelines-as-code/pkg/provider/gitea/forgejostructs"
 	tgitea "github.com/openshift-pipelines/pipelines-as-code/pkg/provider/gitea/test"
 	"go.uber.org/zap"
 	zapobserver "go.uber.org/zap/zaptest/observer"
@@ -25,6 +25,7 @@ func TestCheckPolicyAllowing(t *testing.T) {
 		name                string
 		allowedTeams        []string
 		listOrgReply        string
+		listOrgStatusCode   int
 		listTeamMemberships string
 		wantAllowed         bool
 		wantReason          string
@@ -58,6 +59,13 @@ func TestCheckPolicyAllowing(t *testing.T) {
 			wantReason:   `error while getting org team, error: invalid character 't' in literal true (expecting 'r')`,
 			listOrgReply: `ttttttaaa`,
 		},
+		{
+			name:              "forbidden when listing org teams",
+			allowedTeams:      []string{"allowedTeam"},
+			listOrgStatusCode: http.StatusForbidden,
+			wantAllowed:       false,
+			wantReason:        "unable to list teams on org myorg: the token used doesn't have permission to list teams in this org, make sure the token owner is a member of the org",
+		},
 	}
 
 	for _, tt := range tests {
@@ -69,8 +77,12 @@ func TestCheckPolicyAllowing(t *testing.T) {
 				Organization: "myorg",
 				Sender:       "allowedUser",
 			}
-			if tt.listOrgReply != "" {
+			if tt.listOrgReply != "" || tt.listOrgStatusCode != 0 {
 				mux.HandleFunc(fmt.Sprintf("/orgs/%s/teams", event.Organization), func(rw http.ResponseWriter, _ *http.Request) {
+					if tt.listOrgStatusCode != 0 {
+						rw.WriteHeader(tt.listOrgStatusCode)
+						return
+					}
 					fmt.Fprint(rw, tt.listOrgReply)
 				})
 			}
@@ -99,16 +111,16 @@ func TestCheckPolicyAllowing(t *testing.T) {
 }
 
 func TestOkToTestComment(t *testing.T) {
-	issueCommentPayload := &giteaStructs.IssueCommentPayload{
-		Comment: &giteaStructs.Comment{
+	issueCommentPayload := &forgejostructs.IssueCommentPayload{
+		Comment: &forgejostructs.Comment{
 			ID: 1,
 		},
-		Issue: &giteaStructs.Issue{
+		Issue: &forgejostructs.Issue{
 			URL: "http://url.com/owner/repo/1",
 		},
 	}
-	pullRequestPayload := &giteaStructs.PullRequestPayload{
-		PullRequest: &giteaStructs.PullRequest{
+	pullRequestPayload := &forgejostructs.PullRequestPayload{
+		PullRequest: &forgejostructs.PullRequest{
 			HTMLURL: "http://url.com/owner/repo/1",
 		},
 	}
@@ -156,7 +168,7 @@ func TestOkToTestComment(t *testing.T) {
 				Repository:   "repo",
 				Sender:       "nonowner",
 				EventType:    "issue_comment",
-				Event:        &giteaStructs.RepositoryPayload{},
+				Event:        &forgejostructs.RepositoryPayload{},
 			},
 			allowed:          false,
 			wantErr:          false,
@@ -226,7 +238,7 @@ func TestOkToTestComment(t *testing.T) {
 				Repository:   "repo",
 				Sender:       "nonowner",
 				EventType:    "issue_comment",
-				Event:        &giteaStructs.RepositoryPayload{},
+				Event:        &forgejostructs.RepositoryPayload{},
 			},
 			allowed:          false,
 			wantErr:          false,
@@ -381,7 +393,7 @@ func TestAclCheckAll(t *testing.T) {
 					encoded := base64.StdEncoding.EncodeToString([]byte(
 						fmt.Sprintf("approvers:\n  - %s\n", tt.runevent.Sender)))
 					// encode to json
-					b, err := json.Marshal(gitea.ContentsResponse{
+					b, err := json.Marshal(forgejo.ContentsResponse{
 						Content: &encoded,
 					})
 					if err != nil {

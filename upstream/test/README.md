@@ -45,8 +45,11 @@ this repo should differ from the one which is configured as part of `TEST_GITHUB
 - `TEST_BITBUCKET_CLOUD_E2E_REPOSITORY` - Bitbucket Cloud repository (i.e. `project/repo`)
 - `TEST_BITBUCKET_CLOUD_TOKEN` - Bitbucket Cloud token
 - `TEST_GITLAB_API_URL` - Gitlab API URL i.e: `https://gitlab.com`
-- `TEST_GITLAB_PROJECT_ID` - Gitlab project ID (you can get it in the repo details/settings)
+- `TEST_GITLAB_GROUP` - Gitlab group/namespace where test projects will be created and deleted
 - `TEST_GITLAB_TOKEN` - Gitlab Token
+- `TEST_GITLAB_SECOND_TOKEN` - Optional second GitLab token from a different user for fork-based GitLab tests
+- `TEST_GITLAB_SECOND_GROUP` - Optional group/namespace where the second user should create forks
+- `TEST_GITLAB_SMEEURL` - Smee URL for forwarding GitLab webhooks to the controller
 - `TEST_GITEA_API_URL` - URL where GITEA is running (i.e: [GITEA_HOST](http://localhost:3000))
 - `TEST_GITEA_SMEEURL` - URL of smee
 - `TEST_GITEA_PASSWORD` - set password as **pac**
@@ -61,6 +64,31 @@ this repo should differ from the one which is configured as part of `TEST_GITHUB
 - `PAC_API_INSTRUMENTATION_DIR` - Optional. When set, E2E tests write per-test JSON reports of GitHub API calls parsed from controller logs to this directory. Useful for analyzing API usage and rate limits. Example: `export PAC_API_INSTRUMENTATION_DIR=/tmp/api-instrumentation`.
 
 You don't need to configure all of those if you restrict running your e2e tests to a subset.
+
+### YAML Configuration File
+
+Instead of setting individual environment variables, you can use a YAML
+configuration file. Set `PAC_E2E_CONFIG` to the path of your config file:
+
+```shell
+PAC_E2E_CONFIG=./test/e2e-config.yaml make test-e2e
+```
+
+Copy the example file and fill in the values for the providers you want to test:
+
+```shell
+cp test/e2e-config.yaml.example test/e2e-config.yaml
+# edit test/e2e-config.yaml with your values
+```
+
+The YAML file groups settings by provider section (`common`, `github`,
+`github_enterprise`, `gitlab`, `gitea`, `bitbucket_cloud`,
+`bitbucket_server`). See `test/e2e-config.yaml.example` for the full list of
+fields.
+
+Environment variables always take precedence over YAML values, so you can use
+the config file for base settings and override specific values via env vars
+(useful for CI secrets).
 
 ## Running
 
@@ -77,6 +105,56 @@ You can specify only a subsets of test to run with :
 ```
 
 same goes for `TestGitlab` or other methods.
+
+### Running GitLab tests manually
+
+GitLab tests require a smee URL to forward webhooks from the external GitLab
+instance to your local controller (the same pattern as Gitea tests).
+
+1. Create your own group on the GitLab instance
+   (e.g. `https://gitlab.pipelinesascode.com`) to hold the temporary test
+   projects. Each test run creates a project inside this group and deletes it
+   on cleanup. Use `TEST_GITLAB_GROUP` to point to your group.
+
+2. Generate a smee channel and start the gosmee client to forward webhooks to
+   your controller:
+
+   ```shell
+   # Generate a new smee channel URL
+   SMEE_URL=$(curl -s https://hook.pipelinesascode.com -o /dev/null -w '%{redirect_url}')
+
+   # Start forwarding webhooks to your controller
+   gosmee client "${SMEE_URL}" "https://your-controller-url"
+   ```
+
+3. Set the required environment variables (or use a
+   [YAML config file](#yaml-configuration-file)):
+
+   ```shell
+   export TEST_GITLAB_API_URL=https://gitlab.pipelinesascode.com
+   export TEST_GITLAB_TOKEN=<your-token>
+   export TEST_GITLAB_GROUP=<your-group>
+   export TEST_GITLAB_SECOND_TOKEN=<second-user-token> # optional, required for real fork fallback tests
+   export TEST_GITLAB_SECOND_GROUP=<second-user-group> # optional, recommended when the second user has multiple namespaces
+   export TEST_GITLAB_SMEEURL="${SMEE_URL}"
+   export TEST_EL_URL=https://your-controller-url
+   export TEST_EL_WEBHOOK_SECRET=<your-webhook-secret>
+   ```
+
+   Fork-status fallback tests skip automatically when `TEST_GITLAB_SECOND_TOKEN` is not set.
+
+4. Run the tests:
+
+   ```shell
+   cd test/; go test -tags=e2e -v -run TestGitlab .
+   ```
+
+To clean up stale test projects (older than 7 days) left from previous runs:
+
+```shell
+./hack/cleanup-gitlab-projects.py        # dry-run
+./hack/cleanup-gitlab-projects.py --force # actually delete
+```
 
 If you need to update the golden files in the end-to-end test, add the `-update` flag to the [go test](https://pkg.go.dev/cmd/go#hdr-Test_packages) command to refresh those files. First, run it if you expect the test output to change (or for a new test), then run it again without the flag to ensure everything is correct.
 
@@ -128,10 +206,13 @@ Tests run on:
 
 ### Test Categories
 
-The tests are separated into two main categories (matrix strategy):
+The tests are separated into provider categories (matrix strategy):
 
-- `providers` - Tests for GitHub, GitLab, and Bitbucket
-- `gitea_others` - Tests for Gitea and other non-provider specific functionality
+- `github_public` - Public GitHub tests (excluding GHE and concurrency)
+- `github_ghe` - GitHub Enterprise (GHE) tests
+- `gitlab_bitbucket` - GitLab and Bitbucket tests
+- `gitea_1`, `gitea_2`, `gitea_3` - Gitea tests (split into 3 chunks)
+- `concurrency` - Concurrency-specific tests
 
 This split helps reduce the load on external APIs during testing and provides more focused test results.
 
@@ -151,11 +232,33 @@ Secrets are stored in GitHub Secrets and made available to the workflow via `${{
 The `hack/gh-workflow-ci.sh` script contains several functions that assist in the CI process:
 
 1. `create_pac_github_app_secret` - Creates the required secrets for GitHub app authentication
-2. `create_second_github_app_controller_on_ghe` - Sets up a second controller for GitHub Enterprise
+2. ~~`create_second_github_app_controller_on_ghe`~~ - Use [startpaac](https://github.com/openshift-pipelines/startpaac) instead. See [Second Controller Setup](#second-controller-setup) below.
 3. `run_e2e_tests` - Executes the E2E tests with proper filters
 4. `collect_logs` - Gathers logs and diagnostic information
 
 The script filters tests by category using pattern matching on test function names.
+
+#### Second Controller Setup
+
+In CI, use [startpaac](https://github.com/openshift-pipelines/startpaac) to install the second GitHub controller (GHE). When running with the `--ci` flag, startpaac automatically installs the second controller when `PAC_SECOND_SECRET_FOLDER` is set.
+
+Example from e2e.yaml workflow:
+
+```yaml
+- name: Start installing cluster with startpaac
+  env:
+    PAC_SECOND_SECRET_FOLDER: ~/secrets-second
+  run: |
+    mkdir -p ~/secrets-second
+    echo "${{ vars.TEST_GITHUB_SECOND_APPLICATION_ID }}" > ~/secrets-second/github-application-id
+    echo "${{ secrets.TEST_GITHUB_SECOND_PRIVATE_KEY }}" > ~/secrets-second/github-private-key
+    # ... other secrets ...
+
+    cd startpaac
+    ./startpaac --ci -a  # Automatically installs second controller
+```
+
+For manual setup or non-CI environments, see the [Second Controller documentation](https://pipelinesascode.com/docs/install/second_controller/).
 
 > [!NOTE]
 > For details on how API call metrics are generated and archived as artifacts, see [API Instrumentation (optional)](#api-instrumentation-optional).
@@ -177,8 +280,8 @@ for example:
 
 Log source details:
 
-- Parses controller pod logs from the `pac-controller` container.
-- Uses label selector `app.kubernetes.io/name=controller` (or `ghe-controller` when testing against GHE).
+- Parses controller pod logs by resolving the controller label and container name dynamically.
+- Tries known controller labels first (for example `app.kubernetes.io/name=controller` or `ghe-controller`) and then falls back to the standard PAC controller labels.
 - Considers only log lines after the last occurrence of `github-app: initialized OAuth2 client`.
 - Matches lines containing `GitHub API call completed` and extracts the embedded JSON payload.
 
@@ -243,6 +346,17 @@ For local debugging, you can:
 
 1. Set the same environment variables locally
 2. Run `make test-e2e` with specific test filters
+
+### LLM E2E Tests
+
+The LLM E2E tests uses a fake AI called `nonoai` to reply to the e2e tests and make them reliable (and cheap).
+
+Deploy it with ko with `./pkg/test/nonoai/deployment.yaml`
+
+Responses and fake are included in this json file `./pkg/test/nonoai/responses.json`
+
+See an example of an E2E Test using it in
+[./gitea_llm_test.go](./gitea_llm_test.go)
 
 ### Notifications
 

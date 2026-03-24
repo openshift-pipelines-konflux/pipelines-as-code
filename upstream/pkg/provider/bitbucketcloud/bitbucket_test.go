@@ -11,9 +11,9 @@ import (
 	"github.com/openshift-pipelines/pipelines-as-code/pkg/params/info"
 	"github.com/openshift-pipelines/pipelines-as-code/pkg/params/settings"
 	"github.com/openshift-pipelines/pipelines-as-code/pkg/params/triggertype"
-	"github.com/openshift-pipelines/pipelines-as-code/pkg/provider"
 	bbcloudtest "github.com/openshift-pipelines/pipelines-as-code/pkg/provider/bitbucketcloud/test"
 	"github.com/openshift-pipelines/pipelines-as-code/pkg/provider/bitbucketcloud/types"
+	"github.com/openshift-pipelines/pipelines-as-code/pkg/provider/status"
 	"go.uber.org/zap"
 	zapobserver "go.uber.org/zap/zaptest/observer"
 	"gotest.tools/v3/assert"
@@ -183,7 +183,7 @@ func TestGetCommitInfo(t *testing.T) {
 		repoinfo   *bitbucket.Repository
 	}{
 		{
-			name:  "Get commit info",
+			name:  "Get commit info with author",
 			event: bbcloudtest.MakeEvent(nil),
 			commitinfo: types.Commit{
 				Hash: "convertedcommit",
@@ -192,7 +192,26 @@ func TestGetCommitInfo(t *testing.T) {
 						HRef: "https://everywhereigo",
 					},
 				},
-				Message: "Das Commit",
+				Message: "Das Commit\n\nWith full message details",
+				Author: types.Author{
+					User: types.User{DisplayName: "John Doe"},
+				},
+			},
+			repoinfo: &bitbucket.Repository{
+				Mainbranch: bitbucket.RepositoryBranch{Name: "branshe"},
+			},
+		},
+		{
+			name:  "Get commit info without author",
+			event: bbcloudtest.MakeEvent(nil),
+			commitinfo: types.Commit{
+				Hash: "convertedcommit",
+				Links: types.Links{
+					HTML: types.HTMLLink{
+						HRef: "https://everywhereigo",
+					},
+				},
+				Message: "Simple message",
 				Author:  types.Author{},
 			},
 			repoinfo: &bitbucket.Repository{
@@ -225,12 +244,13 @@ func TestGetCommitInfo(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			ctx, _ := rtesting.SetupFakeContext(t)
+			observer, _ := zapobserver.New(zap.InfoLevel)
+			fakelogger := zap.New(observer).Sugar()
 			bbclient, mux, tearDown := bbcloudtest.SetupBBCloudClient(t)
 			defer tearDown()
-			v := &Provider{bbClient: bbclient}
-			bbcloudtest.MuxCommits(t, mux, tt.event, []types.Commit{
-				tt.commitinfo,
-			})
+			v := &Provider{Logger: fakelogger, bbClient: bbclient}
+			bbcloudtest.MuxCommit(t, mux, tt.event, tt.commitinfo)
+			bbcloudtest.MuxBranch(t, mux, tt.event, tt.commitinfo)
 			bbcloudtest.MuxRepoInfo(t, mux, tt.event, tt.repoinfo)
 
 			if err := v.GetCommitInfo(ctx, tt.event); (err != nil) != tt.wantErr {
@@ -241,76 +261,103 @@ func TestGetCommitInfo(t *testing.T) {
 			assert.Equal(t, tt.commitinfo.Links.HTML.HRef, tt.event.SHAURL)
 			assert.Equal(t, tt.commitinfo.Hash, tt.event.SHA)
 			assert.Equal(t, tt.commitinfo.Message, tt.event.SHATitle)
+
+			// Verify new extended commit fields
+			assert.Equal(t, tt.commitinfo.Message, tt.event.SHAMessage, "SHAMessage should match")
+
+			// Bitbucket Cloud only provides author DisplayName (no email or dates)
+			if tt.commitinfo.Author.User.DisplayName != "" {
+				assert.Equal(t, tt.commitinfo.Author.User.DisplayName, tt.event.SHAAuthorName, "SHAAuthorName should match")
+			}
 		})
 	}
 }
 
 func TestCreateStatus(t *testing.T) {
+	originalPipelineRunName := "hello-af9ch"
 	tests := []struct {
 		name                  string
 		wantErr               bool
-		status                provider.StatusOpts
+		status                status.StatusOpts
+		applicationName       string
 		expectedDescSubstr    string
 		expectedCommentSubstr string
 	}{
 		{
 			name: "skipped",
-			status: provider.StatusOpts{
-				Conclusion: "skipped",
+			status: status.StatusOpts{
+				Conclusion:              "skipped",
+				OriginalPipelineRunName: originalPipelineRunName,
 			},
 			expectedDescSubstr: "Skipping",
 		},
 		{
 			name: "neutral",
-			status: provider.StatusOpts{
-				Conclusion: "neutral",
+			status: status.StatusOpts{
+				Conclusion:              "neutral",
+				OriginalPipelineRunName: originalPipelineRunName,
 			},
 			expectedDescSubstr: "stopped",
 		},
 		{
 			name: "completed with comment",
-			status: provider.StatusOpts{
-				Conclusion: "success",
-				Status:     "completed",
-				Text:       "Happy as a bunny",
+			status: status.StatusOpts{
+				Conclusion:              "success",
+				Status:                  "completed",
+				OriginalPipelineRunName: originalPipelineRunName,
+				Text:                    "Happy as a bunny",
 			},
 			expectedDescSubstr:    "validated",
 			expectedCommentSubstr: "Happy as a bunny",
 		},
 		{
 			name: "failed",
-			status: provider.StatusOpts{
-				Conclusion: "failure",
+			status: status.StatusOpts{
+				Conclusion:              "failure",
+				OriginalPipelineRunName: originalPipelineRunName,
 			},
 			expectedDescSubstr: "Failed",
 		},
 		{
 			name: "details url",
-			status: provider.StatusOpts{
-				Conclusion: "failure",
-				DetailsURL: "http://fail.com",
+			status: status.StatusOpts{
+				Conclusion:              "failure",
+				DetailsURL:              "http://fail.com",
+				OriginalPipelineRunName: originalPipelineRunName,
 			},
 			expectedDescSubstr: "Failed",
 		},
 		{
 			name: "pending",
-			status: provider.StatusOpts{
-				Conclusion: "pending",
+			status: status.StatusOpts{
+				Conclusion:              "pending",
+				OriginalPipelineRunName: originalPipelineRunName,
 			},
 			expectedDescSubstr: "started",
 		},
 		{
 			name: "success",
-			status: provider.StatusOpts{
-				Conclusion: "success",
+			status: status.StatusOpts{
+				Conclusion:              "success",
+				OriginalPipelineRunName: originalPipelineRunName,
 			},
 			expectedDescSubstr: "validated",
 		},
 		{
 			name: "completed",
-			status: provider.StatusOpts{
-				Conclusion: "completed",
+			status: status.StatusOpts{
+				Conclusion:              "completed",
+				OriginalPipelineRunName: originalPipelineRunName,
 			},
+			expectedDescSubstr: "Completed",
+		},
+		{
+			name: "application name",
+			status: status.StatusOpts{
+				Conclusion:              "completed",
+				OriginalPipelineRunName: originalPipelineRunName,
+			},
+			applicationName:    "HELLO APP",
 			expectedDescSubstr: "Completed",
 		},
 	}
@@ -319,12 +366,18 @@ func TestCreateStatus(t *testing.T) {
 			ctx, _ := rtesting.SetupFakeContext(t)
 			bbclient, mux, tearDown := bbcloudtest.SetupBBCloudClient(t)
 			defer tearDown()
+
+			appName := tt.applicationName
+			if appName == "" {
+				appName = settings.PACApplicationNameDefaultValue
+			}
+
 			v := &Provider{
 				bbClient: bbclient,
 				run:      params.New(),
 				pacInfo: &info.PacOpts{
 					Settings: settings.Settings{
-						ApplicationName: settings.PACApplicationNameDefaultValue,
+						ApplicationName: appName,
 					},
 				},
 			}
@@ -332,7 +385,7 @@ func TestCreateStatus(t *testing.T) {
 			event.EventType = "pull_request"
 			event.Provider.Token = "token"
 
-			bbcloudtest.MuxCreateCommitstatus(t, mux, event, tt.expectedDescSubstr, tt.status)
+			bbcloudtest.MuxCreateCommitstatus(t, mux, event, tt.expectedDescSubstr, appName, tt.status)
 			bbcloudtest.MuxCreateComment(t, mux, event, tt.expectedCommentSubstr)
 
 			err := v.CreateStatus(ctx, event, tt.status)

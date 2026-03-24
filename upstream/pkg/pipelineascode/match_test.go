@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/google/go-github/v74/github"
+	"github.com/google/go-github/v81/github"
 	apipac "github.com/openshift-pipelines/pipelines-as-code/pkg/apis/pipelinesascode/keys"
 	"github.com/openshift-pipelines/pipelines-as-code/pkg/apis/pipelinesascode/v1alpha1"
 	"github.com/openshift-pipelines/pipelines-as-code/pkg/consoleui"
@@ -24,11 +24,15 @@ import (
 	testclient "github.com/openshift-pipelines/pipelines-as-code/pkg/test/clients"
 	ghtesthelper "github.com/openshift-pipelines/pipelines-as-code/pkg/test/github"
 	kitesthelper "github.com/openshift-pipelines/pipelines-as-code/pkg/test/kubernetestint"
+	testprovider "github.com/openshift-pipelines/pipelines-as-code/pkg/test/provider"
 	tektonv1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1"
 	"go.uber.org/zap"
 	zapobserver "go.uber.org/zap/zaptest/observer"
 	"gotest.tools/v3/assert"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"knative.dev/pkg/apis"
+	knativeduckv1 "knative.dev/pkg/apis/duck/v1"
 	rtesting "knative.dev/pkg/reconciler/testing"
 )
 
@@ -58,6 +62,13 @@ func TestPacRun_checkNeedUpdate(t *testing.T) {
 }
 
 func TestChangePipelineRun(t *testing.T) {
+	repo := &v1alpha1.Repository{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "testrepo",
+			Namespace: "test",
+		},
+	}
+
 	prs := []*tektonv1.PipelineRun{
 		{
 			ObjectMeta: metav1.ObjectMeta{
@@ -66,21 +77,59 @@ func TestChangePipelineRun(t *testing.T) {
 			},
 		},
 	}
-	event := info.NewEvent()
-	event.Repository = "testrepo"
-	p := &PacRun{event: event}
-	repo := &v1alpha1.Repository{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "testrepo",
-			Namespace: "test",
+
+	jsonErrorPRs := []*tektonv1.PipelineRun{
+		{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "json-error-pr",
+				Namespace: "test",
+			},
+			Spec: tektonv1.PipelineRunSpec{
+				Params: []tektonv1.Param{
+					{
+						Name: "my-param",
+						Value: tektonv1.ParamValue{
+							// We are intentionally leaving this empty:
+							// Type: tektonv1.ParamTypeString,
+							StringVal: "some-value",
+						},
+					},
+				},
+			},
 		},
 	}
-	ctx, _ := rtesting.SetupFakeContext(t)
-	err := p.changePipelineRun(ctx, repo, prs)
-	assert.NilError(t, err)
-	assert.Assert(t, strings.HasPrefix(prs[0].GetName(), "pac-gitauth"), prs[0].GetName(), "has no pac-gitauth prefix")
-	assert.Assert(t, prs[0].GetAnnotations()[apipac.GitAuthSecret] != "")
-	assert.Assert(t, prs[0].GetNamespace() == "testrepo", "namespace should be testrepo: %v", prs[0].GetNamespace())
+
+	tests := []struct {
+		name          string
+		prs           []*tektonv1.PipelineRun
+		expectedError string
+	}{
+		{
+			name: "test with params",
+			prs:  prs,
+		},
+		{
+			name:          "test with json error",
+			prs:           jsonErrorPRs,
+			expectedError: "failed to marshal PipelineRun json-error-pr: json: error calling MarshalJSON for type v1.ParamValue: impossible ParamValues.Type: \"\"",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			event := info.NewEvent()
+			event.Repository = "testrepo"
+			p := &PacRun{event: event}
+			ctx, _ := rtesting.SetupFakeContext(t)
+			err := p.changePipelineRun(ctx, repo, tt.prs)
+			if tt.expectedError != "" {
+				assert.Error(t, err, tt.expectedError)
+				return
+			}
+			assert.Assert(t, strings.HasPrefix(tt.prs[0].GetName(), "pac-gitauth"), tt.prs[0].GetName(), "has no pac-gitauth prefix")
+			assert.Assert(t, tt.prs[0].GetAnnotations()[apipac.GitAuthSecret] != "")
+			assert.Assert(t, tt.prs[0].GetNamespace() == "testrepo", "namespace should be testrepo: %v", tt.prs[0].GetNamespace())
+		})
+	}
 }
 
 func TestFilterRunningPipelineRunOnTargetTest(t *testing.T) {
@@ -102,6 +151,135 @@ func TestFilterRunningPipelineRunOnTargetTest(t *testing.T) {
 	prs = []*tektonv1.PipelineRun{}
 	ret = filterRunningPipelineRunOnTargetTest(testPipeline, prs)
 	assert.Assert(t, ret == nil)
+}
+
+func TestGetPipelineRunsFromRepoExplicitTestUsesTargetNamespaceRepo(t *testing.T) {
+	observerCore, _ := zapobserver.New(zap.InfoLevel)
+	logger := zap.New(observerCore).Sugar()
+
+	tests := []struct {
+		name                string
+		targetNamespaceLine string
+		wantRepositoryNS    string
+		wantRepositoryName  string
+		wantNoMatch         bool
+	}{
+		{
+			name:                "uses target namespace repo from annotation",
+			targetNamespaceLine: "    pipelinesascode.tekton.dev/target-namespace: \"bar\"",
+			wantRepositoryNS:    "bar",
+			wantRepositoryName:  "bar",
+		},
+		{
+			name:                "falls back to matched repo when annotation is absent",
+			targetNamespaceLine: "",
+			wantRepositoryNS:    "foo",
+			wantRepositoryName:  "foo",
+		},
+		{
+			name:                "skips pipelinerun when target namespace repo not found",
+			targetNamespaceLine: "    pipelinesascode.tekton.dev/target-namespace: \"nonexistent\"",
+			wantNoMatch:         true,
+		},
+	}
+
+	template := `apiVersion: tekton.dev/v1beta1
+kind: PipelineRun
+metadata:
+  name: pr-gitops-comment
+  annotations:
+    pipelinesascode.tekton.dev/on-target-branch: "[main]"
+    pipelinesascode.tekton.dev/on-event: "[pull_request]"
+%s
+spec:
+  pipelineSpec:
+    tasks:
+    - name: task
+      taskSpec:
+        steps:
+        - name: task
+          image: quay.io/prometheus/busybox
+          script: |
+            echo "HELLOMOTO"
+            exit 0
+`
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, _ := rtesting.SetupFakeContext(t)
+
+			repositories := []*v1alpha1.Repository{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "foo",
+						Namespace: "foo",
+					},
+					Spec: v1alpha1.RepositorySpec{
+						URL: "https://ghe.pipelinesascode.com/pipelines-as-code/e2e",
+					},
+				},
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "bar",
+						Namespace: "bar",
+					},
+					Spec: v1alpha1.RepositorySpec{
+						URL: "https://ghe.pipelinesascode.com/pipelines-as-code/e2e",
+					},
+				},
+			}
+			stdata, _ := testclient.SeedTestData(t, ctx, testclient.Data{
+				Repositories: repositories,
+			})
+
+			cs := &params.Run{
+				Clients: clients.Clients{
+					PipelineAsCode: stdata.PipelineAsCode,
+					Kube:           stdata.Kube,
+					Tekton:         stdata.Pipeline,
+					Log:            logger,
+				},
+				Info: info.Info{},
+			}
+			cs.Clients.SetConsoleUI(consoleui.FallBackConsole{})
+
+			event := &info.Event{
+				URL:           "https://ghe.pipelinesascode.com/pipelines-as-code/e2e",
+				Organization:  "pipelines-as-code",
+				Repository:    "e2e",
+				Sender:        "foo",
+				SHA:           "abc123",
+				HeadBranch:    "main",
+				BaseBranch:    "main",
+				EventType:     opscomments.TestSingleCommentEventType.String(),
+				TriggerTarget: triggertype.PullRequest,
+				State: info.State{
+					TargetTestPipelineRun: "pr-gitops-comment",
+				},
+			}
+
+			p := NewPacs(
+				event,
+				&testprovider.TestProviderImp{TektonDirTemplate: fmt.Sprintf(template, tt.targetNamespaceLine)},
+				cs,
+				&info.PacOpts{},
+				nil,
+				logger,
+				nil,
+			)
+
+			matchedPRs, err := p.getPipelineRunsFromRepo(ctx, repositories[0])
+			assert.NilError(t, err)
+			if tt.wantNoMatch {
+				assert.Equal(t, len(matchedPRs), 0)
+				return
+			}
+			assert.Equal(t, len(matchedPRs), 1)
+			assert.Assert(t, matchedPRs[0].Repo != nil)
+			assert.Equal(t, matchedPRs[0].Repo.GetNamespace(), tt.wantRepositoryNS)
+			assert.Equal(t, matchedPRs[0].Repo.GetName(), tt.wantRepositoryName)
+		})
+	}
 }
 
 func TestGetPipelineRunsFromRepo(t *testing.T) {
@@ -127,6 +305,18 @@ func TestGetPipelineRunsFromRepo(t *testing.T) {
 		EventType:     "ok-to-test-comment",
 		TriggerTarget: "pull_request",
 	}
+	retestAllEvent := &info.Event{
+		SHA:               "principale",
+		Organization:      "organizationes",
+		Repository:        "lagaffe",
+		URL:               "https://service/documentation",
+		HeadBranch:        "main",
+		BaseBranch:        "main",
+		Sender:            "fantasio",
+		EventType:         opscomments.RetestAllCommentEventType.String(),
+		TriggerTarget:     "pull_request",
+		PullRequestNumber: 10,
+	}
 	testExplicitNoMatchPREvent := &info.Event{
 		SHA:           "principale",
 		Organization:  "organizationes",
@@ -141,6 +331,18 @@ func TestGetPipelineRunsFromRepo(t *testing.T) {
 		},
 	}
 
+	noOpsCommentEvent := &info.Event{
+		SHA:           "principale",
+		Organization:  "organizationes",
+		Repository:    "lagaffe",
+		URL:           "https://service/documentation",
+		HeadBranch:    "main",
+		BaseBranch:    "main",
+		Sender:        "fantasio",
+		EventType:     opscomments.NoOpsCommentEventType.String(),
+		TriggerTarget: "pull_request",
+	}
+
 	tests := []struct {
 		name                  string
 		repositories          *v1alpha1.Repository
@@ -148,6 +350,8 @@ func TestGetPipelineRunsFromRepo(t *testing.T) {
 		expectedNumberOfPruns int
 		event                 *info.Event
 		logSnippet            string
+		wantErr               bool
+		seedData              *testclient.Data
 	}{
 		{
 			name: "more than one pipelinerun in .tekton dir",
@@ -247,6 +451,74 @@ func TestGetPipelineRunsFromRepo(t *testing.T) {
 			expectedNumberOfPruns: 0,
 			event:                 okToTestEvent,
 		},
+		{
+			name: "same name pipelineruns error on regular event",
+			repositories: &v1alpha1.Repository{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "testrepo",
+					Namespace: "test",
+				},
+				Spec: v1alpha1.RepositorySpec{},
+			},
+			tektondir: "testdata/same_name_pipelineruns",
+			event:     pullRequestEvent,
+			wantErr:   true,
+		},
+		{
+			name: "same name pipelineruns skipped on no-ops comment event",
+			repositories: &v1alpha1.Repository{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "testrepo",
+					Namespace: "test",
+				},
+				Spec: v1alpha1.RepositorySpec{},
+			},
+			tektondir:             "testdata/same_name_pipelineruns",
+			expectedNumberOfPruns: 0,
+			event:                 noOpsCommentEvent,
+			logSnippet:            "skipping MetadataResolve error for no-ops comment event",
+		},
+		{
+			name: "retest when all pipelines already succeeded returns no runs and posts comment",
+			repositories: &v1alpha1.Repository{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "testrepo",
+					Namespace: "test",
+				},
+				Spec: v1alpha1.RepositorySpec{},
+			},
+			tektondir:             "testdata/pull_request",
+			expectedNumberOfPruns: 0,
+			event:                 retestAllEvent,
+			logSnippet:            "All PipelineRuns for this commit have already succeeded",
+			seedData: &testclient.Data{
+				Repositories: []*v1alpha1.Repository{{
+					ObjectMeta: metav1.ObjectMeta{Name: "testrepo", Namespace: "test"},
+					Spec:       v1alpha1.RepositorySpec{},
+				}},
+				PipelineRuns: []*tektonv1.PipelineRun{{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "pull_request-xyz",
+						Namespace: "test",
+						Labels: map[string]string{
+							apipac.SHA:            "principale",
+							apipac.OriginalPRName: "pull_request",
+						},
+						Annotations: map[string]string{
+							apipac.OriginalPRName: "pull_request",
+						},
+					},
+					Status: tektonv1.PipelineRunStatus{
+						Status: knativeduckv1.Status{
+							Conditions: knativeduckv1.Conditions{{
+								Type:   apis.ConditionSucceeded,
+								Status: corev1.ConditionTrue,
+							}},
+						},
+					},
+				}},
+			},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -256,11 +528,23 @@ func TestGetPipelineRunsFromRepo(t *testing.T) {
 			fakeclient, mux, _, teardown := ghtesthelper.SetupGH()
 			defer teardown()
 
+			// For retest-when-all-succeeded case, CreateComment is called; register handler so it succeeds.
+			if tt.name == "retest when all pipelines already succeeded returns no runs and posts comment" {
+				mux.HandleFunc("/repos/organizationes/lagaffe/issues/10/comments", func(w http.ResponseWriter, r *http.Request) {
+					if r.Method == http.MethodPost {
+						w.WriteHeader(http.StatusCreated)
+					}
+				})
+			}
 			if tt.tektondir != "" {
 				ghtesthelper.SetupGitTree(t, mux, tt.tektondir, tt.event, false)
 			}
 
-			stdata, _ := testclient.SeedTestData(t, ctx, testclient.Data{})
+			seedData := testclient.Data{}
+			if tt.seedData != nil {
+				seedData = *tt.seedData
+			}
+			stdata, _ := testclient.SeedTestData(t, ctx, seedData)
 			cs := &params.Run{
 				Clients: clients.Clients{
 					PipelineAsCode: stdata.PipelineAsCode,
@@ -289,10 +573,14 @@ func TestGetPipelineRunsFromRepo(t *testing.T) {
 			p := NewPacs(tt.event, vcx, cs, pacInfo, k8int, logger, nil)
 			p.eventEmitter = events.NewEventEmitter(stdata.Kube, logger)
 			matchedPRs, err := p.getPipelineRunsFromRepo(ctx, tt.repositories)
+			if tt.wantErr {
+				assert.Assert(t, err != nil, "expected an error but got nil")
+				return
+			}
 			assert.NilError(t, err)
-			matchedPRNames := []string{}
+			matchedPRNames := make([]string, len(matchedPRs))
 			for i := range matchedPRs {
-				matchedPRNames = append(matchedPRNames, matchedPRs[i].PipelineRun.GetGenerateName())
+				matchedPRNames[i] = matchedPRs[i].PipelineRun.GetGenerateName()
 			}
 			if tt.logSnippet != "" {
 				assert.Assert(t, logCatcher.FilterMessageSnippet(tt.logSnippet).Len() > 0, logCatcher.All())
@@ -442,28 +730,6 @@ func TestVerifyRepoAndUser(t *testing.T) {
 			wantRepoNil:   true,
 			wantErr:       true,
 			wantErrMsg:    "failed to run create status, user is not allowed to run the CI",
-		},
-		{
-			name: "commit not found",
-			runevent: info.Event{
-				Organization:   "owner",
-				Repository:     "repo",
-				URL:            "https://example.com/owner/repo",
-				SHA:            "",
-				EventType:      triggertype.PullRequest.String(),
-				TriggerTarget:  triggertype.PullRequest,
-				InstallationID: 1,
-				Sender:         "owner",
-				Request:        request,
-			},
-			repositories: []*v1alpha1.Repository{{
-				ObjectMeta: metav1.ObjectMeta{Name: "repo", Namespace: "ns"},
-				Spec:       v1alpha1.RepositorySpec{URL: "https://example.com/owner/repo"},
-			}},
-			webhookSecret: "secret",
-			wantRepoNil:   false,
-			wantErr:       true,
-			wantErrMsg:    "could not find commit info",
 		},
 		{
 			name: "happy path",

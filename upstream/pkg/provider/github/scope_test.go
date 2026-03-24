@@ -71,6 +71,102 @@ func TestScopeTokenToListOfRepos(t *testing.T) {
 			URL: privateRepo,
 		},
 	}
+
+	// Additional repos for glob pattern testing
+	repoDataGlobAndExact := &v1alpha1.Repository{
+		TypeMeta: metav1.TypeMeta{},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "publicrepo-glob-and-exact",
+			Namespace: testNamespace.Name,
+		},
+		Spec: v1alpha1.RepositorySpec{
+			URL: repoFromWhichEventComes,
+			Settings: &v1alpha1.Settings{
+				GithubAppTokenScopeRepos: []string{"owner1/repo1", "owner2/*"},
+			},
+		},
+	}
+
+	repoDataInvalidGlob := &v1alpha1.Repository{
+		TypeMeta: metav1.TypeMeta{},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "publicrepo-invalid-glob",
+			Namespace: testNamespace.Name,
+		},
+		Spec: v1alpha1.RepositorySpec{
+			URL: repoFromWhichEventComes,
+			Settings: &v1alpha1.Settings{
+				GithubAppTokenScopeRepos: []string{"owner2/[invalid"},
+			},
+		},
+	}
+
+	repoDataGlobNoMatch := &v1alpha1.Repository{
+		TypeMeta: metav1.TypeMeta{},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "publicrepo-glob-nomatch",
+			Namespace: testNamespace.Name,
+		},
+		Spec: v1alpha1.RepositorySpec{
+			URL: repoFromWhichEventComes,
+			Settings: &v1alpha1.Settings{
+				GithubAppTokenScopeRepos: []string{"nonexistent/*"},
+			},
+		},
+	}
+
+	// Additional private repos for glob testing
+	privateRepo2 := "https://org.com/owner2/repo3"
+	repoData2 := &v1alpha1.Repository{
+		TypeMeta: metav1.TypeMeta{},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "privaterepo2",
+			Namespace: testNamespace.Name,
+		},
+		Spec: v1alpha1.RepositorySpec{
+			URL: privateRepo2,
+		},
+	}
+
+	privateRepo3 := "https://org.com/owner1/repo1"
+	repoData3 := &v1alpha1.Repository{
+		TypeMeta: metav1.TypeMeta{},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "privaterepo3",
+			Namespace: testNamespace.Name,
+		},
+		Spec: v1alpha1.RepositorySpec{
+			URL: privateRepo3,
+		},
+	}
+
+	// Malformed repository URLs for testing validation
+	malformedRepoURL := "https://org.com/owner/repo/subgroup"
+	repoDataMalformed := &v1alpha1.Repository{
+		TypeMeta: metav1.TypeMeta{},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "malformedrepo",
+			Namespace: testNamespace.Name,
+		},
+		Spec: v1alpha1.RepositorySpec{
+			URL: malformedRepoURL,
+		},
+	}
+
+	repoDataMalformedPattern := &v1alpha1.Repository{
+		TypeMeta: metav1.TypeMeta{},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "publicrepo-malformed-pattern",
+			Namespace: testNamespace.Name,
+		},
+		Spec: v1alpha1.RepositorySpec{
+			URL: repoFromWhichEventComes,
+			Settings: &v1alpha1.Settings{
+				GithubAppTokenScopeRepos: []string{"owner/repo/extra"},
+			},
+		},
+	}
+
 	tests := []struct {
 		name                     string
 		tData                    testclient.Data
@@ -129,7 +225,7 @@ func TestScopeTokenToListOfRepos(t *testing.T) {
 			},
 			repository:            repoData,
 			repoListsByGlobalConf: "",
-			wantError:             "failed to scope GitHub token as repo owner2/repo2 does not exist in namespace pipelinesascode",
+			wantError:             "failed to scope GitHub token as repo with pattern owner2/repo2 does not exist in namespace pipelinesascode",
 			wantToken:             "",
 		},
 		{
@@ -177,6 +273,129 @@ func TestScopeTokenToListOfRepos(t *testing.T) {
 			wantError:                "",
 			wantToken:                "123abcdfrf",
 			repositoryID:             []int64{789, 10112, 112233},
+		},
+		{
+			name: "repos are listed using both glob pattern and exact match",
+			tData: testclient.Data{
+				Namespaces: []*corev1.Namespace{testNamespace},
+				Secret:     []*corev1.Secret{validSecret},
+				Repositories: []*v1alpha1.Repository{
+					repoDataGlobAndExact, repoData1, repoData2, repoData3,
+				},
+			},
+			repository:            repoDataGlobAndExact,
+			repoListsByGlobalConf: "",
+			wantError:             "",
+			wantToken:             "123abcdfrf",
+			repositoryID:          []int64{789, 10112, 112233, 445566},
+		},
+		{
+			name: "invalid glob pattern returns error",
+			tData: testclient.Data{
+				Namespaces: []*corev1.Namespace{testNamespace},
+				Secret:     []*corev1.Secret{validSecret},
+				Repositories: []*v1alpha1.Repository{
+					repoDataInvalidGlob, repoData1,
+				},
+			},
+			repository:            repoDataInvalidGlob,
+			repoListsByGlobalConf: "",
+			wantError:             "invalid repo glob specified",
+			wantToken:             "",
+		},
+		{
+			name: "glob pattern that matches no repos returns error",
+			tData: testclient.Data{
+				Namespaces: []*corev1.Namespace{testNamespace},
+				Secret:     []*corev1.Secret{validSecret},
+				Repositories: []*v1alpha1.Repository{
+					repoDataGlobNoMatch, repoData1,
+				},
+			},
+			repository:            repoDataGlobNoMatch,
+			repoListsByGlobalConf: "",
+			wantError:             "failed to scope GitHub token as repo with pattern nonexistent/* does not exist in namespace pipelinesascode",
+			wantToken:             "",
+		},
+		{
+			name: "invalid glob pattern in global config returns error",
+			tData: testclient.Data{
+				Namespaces: []*corev1.Namespace{testNamespace},
+				Secret:     []*corev1.Secret{validSecret},
+			},
+			repository: &v1alpha1.Repository{
+				TypeMeta: metav1.TypeMeta{},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "publicrepo",
+					Namespace: testNamespace.Name,
+				},
+				Spec: v1alpha1.RepositorySpec{
+					URL: repoFromWhichEventComes,
+				},
+			},
+			repoListsByGlobalConf: "owner1/[invalid",
+			wantError:             "invalid repo glob specified",
+			wantToken:             "",
+		},
+		{
+			name: "malformed repository URL with extra path segments returns error",
+			tData: testclient.Data{
+				Namespaces: []*corev1.Namespace{testNamespace},
+				Secret:     []*corev1.Secret{validSecret},
+				Repositories: []*v1alpha1.Repository{
+					repoData, repoDataMalformed,
+				},
+			},
+			repository: &v1alpha1.Repository{
+				TypeMeta: metav1.TypeMeta{},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "publicrepo",
+					Namespace: testNamespace.Name,
+				},
+				Spec: v1alpha1.RepositorySpec{
+					URL: repoFromWhichEventComes,
+					Settings: &v1alpha1.Settings{
+						GithubAppTokenScopeRepos: []string{"owner/repo/subgroup"},
+					},
+				},
+			},
+			repoListsByGlobalConf: "",
+			wantError:             "github repository URL must follow https://github.com/org/repo format without subgroups",
+			wantToken:             "",
+		},
+		{
+			name: "malformed pattern with extra path segments returns error",
+			tData: testclient.Data{
+				Namespaces: []*corev1.Namespace{testNamespace},
+				Secret:     []*corev1.Secret{validSecret},
+				Repositories: []*v1alpha1.Repository{
+					repoDataMalformedPattern, repoData1,
+				},
+			},
+			repository:            repoDataMalformedPattern,
+			repoListsByGlobalConf: "",
+			wantError:             "failed to scope GitHub token as repo with pattern owner/repo/extra does not exist in namespace",
+			wantToken:             "",
+		},
+		{
+			name: "malformed pattern in global config with extra path segments returns error",
+			tData: testclient.Data{
+				Namespaces: []*corev1.Namespace{testNamespace},
+				Secret:     []*corev1.Secret{validSecret},
+			},
+			repository: &v1alpha1.Repository{
+				TypeMeta: metav1.TypeMeta{},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "publicrepo",
+					Namespace: testNamespace.Name,
+				},
+				Spec: v1alpha1.RepositorySpec{
+					URL: repoFromWhichEventComes,
+				},
+			},
+			repoListsByGlobalConf: "owner/repo/extra",
+			wantError:             "github repository URL must follow",
+			wantToken:             "",
 		},
 	}
 	for _, tt := range tests {
@@ -232,7 +451,7 @@ func TestScopeTokenToListOfRepos(t *testing.T) {
 				pacInfo:  pacInfo,
 			}
 
-			extraRepoInstallIDs := map[string]string{"owner/repo": "789", "owner1/repo1": "10112", "owner2/repo2": "112233"}
+			extraRepoInstallIDs := map[string]string{"owner/repo": "789", "owner1/repo1": "10112", "owner2/repo2": "112233", "owner2/repo3": "445566"}
 			for v := range extraRepoInstallIDs {
 				split := strings.Split(v, "/")
 				mux.HandleFunc(fmt.Sprintf("/repos/%s/%s", split[0], split[1]), func(w http.ResponseWriter, _ *http.Request) {
@@ -243,8 +462,11 @@ func TestScopeTokenToListOfRepos(t *testing.T) {
 			eventEmitter := events.NewEventEmitter(run.Clients.Kube, logger)
 			token, err := ScopeTokenToListOfRepos(ctx, gvcs, pacInfo, tt.repository, run, info, eventEmitter, logger)
 			assert.Equal(t, token, tt.wantToken)
-			if err != nil {
-				assert.Equal(t, err.Error(), tt.wantError)
+			if tt.wantError != "" {
+				assert.Assert(t, err != nil, "expected error but got none")
+				assert.Assert(t, strings.Contains(err.Error(), tt.wantError), "error %q should contain %q", err.Error(), tt.wantError)
+			} else {
+				assert.NilError(t, err)
 			}
 			assert.Equal(t, len(gvcs.RepositoryIDs), len(tt.repositoryID))
 		})

@@ -9,6 +9,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/openshift-pipelines/pipelines-as-code/pkg/apis/pipelinesascode/v1alpha1"
@@ -19,7 +20,8 @@ import (
 	"github.com/openshift-pipelines/pipelines-as-code/pkg/params/info"
 	"github.com/openshift-pipelines/pipelines-as-code/pkg/params/triggertype"
 	"github.com/openshift-pipelines/pipelines-as-code/pkg/provider"
-	providerMetrics "github.com/openshift-pipelines/pipelines-as-code/pkg/provider/metrics"
+	providerMetrics "github.com/openshift-pipelines/pipelines-as-code/pkg/provider/providermetrics"
+	providerstatus "github.com/openshift-pipelines/pipelines-as-code/pkg/provider/status"
 	gitlab "gitlab.com/gitlab-org/api/client-go"
 	"go.uber.org/zap"
 )
@@ -53,9 +55,9 @@ type Provider struct {
 	run               *params.Run
 	pacInfo           *info.PacOpts
 	Token             *string
-	targetProjectID   int
-	sourceProjectID   int
-	userID            int
+	targetProjectID   int64
+	sourceProjectID   int64
+	userID            int64
 	pathWithNamespace string
 	repoURL           string
 	apiURL            string
@@ -64,7 +66,13 @@ type Provider struct {
 	triggerEvent      string
 	// memberCache caches membership/permission checks by user ID within the
 	// current provider instance lifecycle to avoid repeated API calls.
-	memberCache map[int]bool
+	memberCache        map[int64]bool
+	cachedChangedFiles *changedfiles.ChangedFiles
+	pacUserID          int64 // user login used by PAC
+}
+
+var defaultGitlabListOptions = gitlab.ListOptions{
+	PerPage: 100,
 }
 
 func (v *Provider) Client() *gitlab.Client {
@@ -98,32 +106,62 @@ func (v *Provider) CreateComment(_ context.Context, event *info.Event, commit, u
 
 	// List comments of the merge request
 	if updateMarker != "" {
-		comments, _, err := v.Client().Notes.ListMergeRequestNotes(event.TargetProjectID, event.PullRequestNumber, &gitlab.ListMergeRequestNotesOptions{
-			ListOptions: gitlab.ListOptions{
-				Page:    1,
-				PerPage: 100,
-			},
-		})
-		if err != nil {
-			return err
-		}
+		commentRe := regexp.MustCompile(regexp.QuoteMeta(updateMarker))
+		options := []gitlab.RequestOptionFunc{}
 
-		re := regexp.MustCompile(updateMarker)
-		for _, comment := range comments {
-			if re.MatchString(comment.Body) {
-				_, _, err := v.Client().Notes.UpdateMergeRequestNote(event.TargetProjectID, event.PullRequestNumber, comment.ID, &gitlab.UpdateMergeRequestNoteOptions{
-					Body: &commit,
-				})
+		for {
+			comments, resp, err := v.Client().Notes.ListMergeRequestNotes(event.TargetProjectID, int64(event.PullRequestNumber), &gitlab.ListMergeRequestNotesOptions{ListOptions: defaultGitlabListOptions}, options...)
+			if err != nil {
 				return err
+			}
+
+			for _, comment := range comments {
+				if commentRe.MatchString(comment.Body) {
+					// Get the UserID for the PAC user.
+					if v.pacUserID == 0 {
+						pacUser, _, err := v.Client().Users.CurrentUser()
+						if err != nil {
+							return fmt.Errorf("unable to fetch user info: %w", err)
+						}
+						v.pacUserID = pacUser.ID
+					}
+					// Only edit comments created by this PAC installation's credentials.
+					// Prevents accidentally modifying comments from other users/bots.
+					if comment.Author.ID != v.pacUserID {
+						v.Logger.Debugf("This comment was not created by PAC, skipping comment edit :%d, created by user %d, PAC user: %d",
+							comment.ID, comment.Author.ID, v.pacUserID)
+						continue
+					}
+
+					_, _, err := v.Client().Notes.UpdateMergeRequestNote(event.TargetProjectID, int64(event.PullRequestNumber), comment.ID, &gitlab.UpdateMergeRequestNoteOptions{
+						Body: &commit,
+					})
+					if err != nil {
+						return fmt.Errorf("unable to update merge request note: %w", err)
+					}
+					return nil
+				}
+			}
+
+			// Exit the loop when we've seen all pages.
+			if resp.NextLink == "" {
+				break
+			}
+
+			// Otherwise, set param to query the next page
+			options = []gitlab.RequestOptionFunc{
+				gitlab.WithKeysetPaginationParameters(resp.NextLink),
 			}
 		}
 	}
 
-	_, _, err := v.Client().Notes.CreateMergeRequestNote(event.TargetProjectID, event.PullRequestNumber, &gitlab.CreateMergeRequestNoteOptions{
+	_, _, err := v.Client().Notes.CreateMergeRequestNote(event.TargetProjectID, int64(event.PullRequestNumber), &gitlab.CreateMergeRequestNoteOptions{
 		Body: &commit,
 	})
-
-	return err
+	if err != nil {
+		return fmt.Errorf("unable to create merge request note: %w", err)
+	}
+	return nil
 }
 
 // CheckPolicyAllowing TODO: Implement ME.
@@ -137,12 +175,16 @@ func (v *Provider) SetLogger(logger *zap.SugaredLogger) {
 
 func (v *Provider) Validate(_ context.Context, _ *params.Run, event *info.Event) error {
 	token := event.Request.Header.Get("X-Gitlab-Token")
-	if event.Provider.WebhookSecret == "" && token != "" {
-		return fmt.Errorf("gitlab failed validation: failed to find webhook secret")
+	if token == "" {
+		return fmt.Errorf("no X-Gitlab-Token header detected: webhook validation requires a token for security")
+	}
+
+	if event.Provider.WebhookSecret == "" {
+		return fmt.Errorf("no webhook secret configured: set webhook secret in repository CR or secret")
 	}
 
 	if subtle.ConstantTimeCompare([]byte(event.Provider.WebhookSecret), []byte(token)) == 0 {
-		return fmt.Errorf("gitlab failed validation: event's secret doesn't match with webhook secret")
+		return fmt.Errorf("gitlab webhook validation failed: token does not match configured secret")
 	}
 	return nil
 }
@@ -173,6 +215,11 @@ func (v *Provider) SetClient(_ context.Context, run *params.Run, runevent *info.
 	if runevent.Provider.Token == "" {
 		return fmt.Errorf("no git_provider.secret has been set in the repo crd")
 	}
+
+	v.run = run
+	v.eventEmitter = eventsEmitter
+	v.repo = repo
+	v.triggerEvent = runevent.EventType
 
 	// Try to detect automatically the API url if url is not coming from public
 	// gitlab. Unless user has set a spec.provider.url in its repo crd
@@ -244,43 +291,48 @@ func (v *Provider) SetClient(_ context.Context, run *params.Run, runevent *info.
 		runevent.TargetProjectID = projectinfo.ID
 		runevent.DefaultBranch = projectinfo.DefaultBranch
 	}
-	v.run = run
-	v.eventEmitter = eventsEmitter
-	v.repo = repo
-	v.triggerEvent = runevent.EventType
 
 	return nil
 }
 
 //nolint:misspell
-func (v *Provider) CreateStatus(_ context.Context, event *info.Event, statusOpts provider.StatusOpts,
+func (v *Provider) CreateStatus(ctx context.Context, event *info.Event, statusOpts providerstatus.StatusOpts,
 ) error {
 	var detailsURL string
 	if v.gitlabClient == nil {
 		return fmt.Errorf("no gitlab client has been initialized, " +
 			"exiting... (hint: did you forget setting a secret on your repo?)")
 	}
+
+	var state gitlab.BuildStateValue
+
 	switch statusOpts.Conclusion {
-	case "skipped":
-		statusOpts.Conclusion = "canceled"
+	case providerstatus.ConclusionSkipped:
+		state = gitlab.Canceled
 		statusOpts.Title = "skipped validating this commit"
-	case "neutral":
-		statusOpts.Conclusion = "canceled"
+	case providerstatus.ConclusionNeutral:
+		state = gitlab.Canceled
 		statusOpts.Title = "stopped"
-	case "cancelled":
-		statusOpts.Conclusion = "canceled"
+	case providerstatus.ConclusionCancelled:
+		state = gitlab.Canceled
 		statusOpts.Title = "cancelled validating this commit"
-	case "failure":
-		statusOpts.Conclusion = "failed"
+	case providerstatus.ConclusionFailure:
+		state = gitlab.Failed
 		statusOpts.Title = "failed"
-	case "success":
-		statusOpts.Conclusion = "success"
+	case providerstatus.ConclusionSuccess:
+		state = gitlab.Success
 		statusOpts.Title = "successfully validated your commit"
-	case "completed":
-		statusOpts.Conclusion = "success"
+	case providerstatus.ConclusionCompleted:
+		state = gitlab.Success
 		statusOpts.Title = "completed"
-	case "pending":
-		statusOpts.Conclusion = "running"
+	case providerstatus.ConclusionPending:
+		state = gitlab.Running
+	}
+
+	// When the pipeline is actually running (in_progress), show it as running
+	// not pending. Pending is only for waiting states like /ok-to-test approval.
+	if statusOpts.Status == "in_progress" {
+		state = gitlab.Running
 	}
 	if statusOpts.DetailsURL != "" {
 		detailsURL = statusOpts.DetailsURL
@@ -295,7 +347,7 @@ func (v *Provider) CreateStatus(_ context.Context, event *info.Event, statusOpts
 
 	contextName := provider.GetCheckName(statusOpts, v.pacInfo)
 	opt := &gitlab.SetCommitStatusOptions{
-		State:       gitlab.BuildStateValue(statusOpts.Conclusion),
+		State:       state,
 		Name:        gitlab.Ptr(contextName),
 		TargetURL:   gitlab.Ptr(detailsURL),
 		Description: gitlab.Ptr(statusOpts.Title),
@@ -317,12 +369,21 @@ func (v *Provider) CreateStatus(_ context.Context, event *info.Event, statusOpts
 		v.Logger.Debugf("created commit status on source project ID %d", event.TargetProjectID)
 		return nil
 	}
-	if _, _, err2 := v.Client().Commits.SetCommitStatus(event.TargetProjectID, event.SHA, opt); err2 == nil {
+	if _, _, err = v.Client().Commits.SetCommitStatus(event.TargetProjectID, event.SHA, opt); err == nil {
 		v.Logger.Debugf("created commit status on target project ID %d", event.TargetProjectID)
 		// we managed to set the status on the target repo, all good we are done
 		return nil
 	}
 	v.Logger.Debugf("cannot set status with the GitLab token on the target project: %v", err)
+
+	// Skip creating MR comments if the error is a state transition error
+	// (e.g., "Cannot transition status via :run from :running").
+	// This means the status is already set, so we should not create a comment.
+	if strings.Contains(err.Error(), "Cannot transition status") {
+		v.Logger.Debugf("skipping MR comment as error is not permission related: %v", err)
+		return nil
+	}
+
 	// we only show the first error as it's likely something the user has more control to fix
 	// the second err is cryptic as it needs a dummy gitlab pipeline to start
 	// with and will only give more confusion in the event namespace
@@ -345,18 +406,97 @@ func (v *Provider) CreateStatus(_ context.Context, event *info.Event, statusOpts
 		commentStrategy = v.repo.Spec.Settings.Gitlab.CommentStrategy
 	}
 	switch commentStrategy {
-	case "disable_all":
+	case provider.DisableAllCommentStrategy:
 		v.Logger.Warn("Comments related to PipelineRuns status have been disabled for GitLab merge requests")
 		return nil
+	case provider.UpdateCommentStrategy:
+		if eventType == triggertype.PullRequest || provider.Valid(event.EventType, anyMergeRequestEventType) {
+			statusComment := v.formatPipelineComment(event.SHA, statusOpts)
+			// Creating the prefix that is added to the status comment for a pipeline run.
+			plrStatusCommentPrefix := fmt.Sprintf(provider.PlrStatusCommentPrefixTemplate, statusOpts.OriginalPipelineRunName)
+			// The entire markdown comment, including the prefix that is added to the pull request for the pipelinerun.
+			markdownStatusComment := fmt.Sprintf("%s\n%s", plrStatusCommentPrefix, statusComment)
+
+			if err := v.CreateComment(ctx, event, markdownStatusComment, plrStatusCommentPrefix); err != nil {
+				v.eventEmitter.EmitMessage(
+					v.repo,
+					zap.ErrorLevel,
+					"PipelineRunCommentCreationError",
+					fmt.Sprintf("failed to create comment: %s", err.Error()),
+				)
+				return err
+			}
+		}
 	default:
 		if eventType == triggertype.PullRequest || provider.Valid(event.EventType, anyMergeRequestEventType) {
 			mopt := &gitlab.CreateMergeRequestNoteOptions{Body: gitlab.Ptr(body)}
-			_, _, err := v.Client().Notes.CreateMergeRequestNote(event.TargetProjectID, event.PullRequestNumber, mopt)
+			_, _, err := v.Client().Notes.CreateMergeRequestNote(event.TargetProjectID, int64(event.PullRequestNumber), mopt)
 			return err
 		}
 	}
 
 	return nil
+}
+
+func (v *Provider) GetCommitStatuses(_ context.Context, event *info.Event) ([]provider.CommitStatusInfo, error) {
+	if v.gitlabClient == nil {
+		return nil, fmt.Errorf("%s", noClientErrStr)
+	}
+
+	sourceProjectID := event.SourceProjectID
+	if sourceProjectID == 0 {
+		sourceProjectID = v.sourceProjectID
+	}
+
+	targetProjectID := event.TargetProjectID
+	if targetProjectID == 0 {
+		targetProjectID = v.targetProjectID
+	}
+
+	projectIDs := []int64{}
+	if sourceProjectID != 0 {
+		projectIDs = append(projectIDs, sourceProjectID)
+	}
+	if targetProjectID != 0 && targetProjectID != sourceProjectID {
+		projectIDs = append(projectIDs, targetProjectID)
+	}
+
+	var (
+		firstErr error
+		result   []provider.CommitStatusInfo
+		seen     = map[string]struct{}{}
+	)
+
+	for _, projectID := range projectIDs {
+		statuses, _, err := v.Client().Commits.GetCommitStatuses(projectID, event.SHA, &gitlab.GetCommitStatusesOptions{})
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			if v.Logger != nil {
+				v.Logger.Debugf("failed to get commit statuses from gitlab project ID %d for SHA %s: %v", projectID, event.SHA, err)
+			}
+			continue
+		}
+
+		for _, s := range statuses {
+			key := fmt.Sprintf("%s\x00%s", s.Name, s.Status)
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			result = append(result, provider.CommitStatusInfo{
+				Name:   s.Name,
+				Status: s.Status,
+			})
+		}
+	}
+
+	if len(result) > 0 {
+		return result, nil
+	}
+
+	return nil, firstErr
 }
 
 func (v *Provider) GetTektonDir(_ context.Context, event *info.Event, path, provenance string) (string, error) {
@@ -384,7 +524,7 @@ func (v *Provider) GetTektonDir(_ context.Context, event *info.Event, path, prov
 		ListOptions: gitlab.ListOptions{
 			OrderBy:    "id",
 			Pagination: "keyset",
-			PerPage:    20,
+			PerPage:    defaultGitlabListOptions.PerPage,
 			Sort:       "asc",
 		},
 	}
@@ -440,7 +580,7 @@ func (v *Provider) concatAllYamlFiles(objects []*gitlab.TreeNode, revision strin
 	return allTemplates, nil
 }
 
-func (v *Provider) getObject(fname, branch string, pid int) ([]byte, *gitlab.Response, error) {
+func (v *Provider) getObject(fname, branch string, pid int64) ([]byte, *gitlab.Response, error) {
 	opt := &gitlab.GetRawFileOptions{
 		Ref: gitlab.Ptr(branch),
 	}
@@ -477,34 +617,152 @@ func (v *Provider) GetCommitInfo(_ context.Context, runevent *info.Event) error 
 		runevent.SHA = branchinfo.ID
 		runevent.SHATitle = branchinfo.Title
 		runevent.SHAURL = branchinfo.WebURL
+
+		// Populate full commit information for LLM context
+		runevent.SHAMessage = branchinfo.Message
+		runevent.SHAAuthorName = branchinfo.AuthorName
+		runevent.SHAAuthorEmail = branchinfo.AuthorEmail
+		if branchinfo.AuthoredDate != nil {
+			runevent.SHAAuthorDate = *branchinfo.AuthoredDate
+		}
+		runevent.SHACommitterName = branchinfo.CommitterName
+		runevent.SHACommitterEmail = branchinfo.CommitterEmail
+		if branchinfo.CommittedDate != nil {
+			runevent.SHACommitterDate = *branchinfo.CommittedDate
+		}
 	}
+	runevent.HasSkipCommand = provider.SkipCI(runevent.SHAMessage)
 
 	return nil
 }
 
-func (v *Provider) GetFiles(_ context.Context, runevent *info.Event) (changedfiles.ChangedFiles, error) {
+// GetFiles gets and caches the list of files changed by a given event.
+func (v *Provider) GetFiles(ctx context.Context, runevent *info.Event) (changedfiles.ChangedFiles, error) {
+	if v.cachedChangedFiles == nil {
+		changes, err := v.fetchChangedFiles(ctx, runevent)
+		if err != nil {
+			return changedfiles.ChangedFiles{}, err
+		}
+		v.cachedChangedFiles = &changes
+	}
+	return *v.cachedChangedFiles, nil
+}
+
+func (v *Provider) fetchChangedFiles(_ context.Context, runevent *info.Event) (changedfiles.ChangedFiles, error) {
 	if v.gitlabClient == nil {
 		return changedfiles.ChangedFiles{}, fmt.Errorf("no gitlab client has been initialized, " +
 			"exiting... (hint: did you forget setting a secret on your repo?)")
 	}
-	if runevent.TriggerTarget == triggertype.PullRequest {
-		opt := &gitlab.ListMergeRequestDiffsOptions{
-			ListOptions: gitlab.ListOptions{
-				OrderBy:    "id",
-				Pagination: "keyset",
-				PerPage:    20,
-				Sort:       "asc",
-			},
+
+	changedFiles := changedfiles.ChangedFiles{}
+
+	switch runevent.TriggerTarget {
+	case triggertype.PullRequest:
+		var err error
+		changedFiles, err = v.mergeRequestFilesChanged(runevent)
+		if err != nil {
+			return changedfiles.ChangedFiles{}, err
 		}
-		options := []gitlab.RequestOptionFunc{}
-		changedFiles := changedfiles.ChangedFiles{}
+	case triggertype.Push:
+		options := gitlab.GetCommitDiffOptions{ListOptions: defaultGitlabListOptions}
+		pageOpts := []gitlab.RequestOptionFunc{}
 
 		for {
-			mrchanges, resp, err := v.Client().MergeRequests.ListMergeRequestDiffs(v.targetProjectID, runevent.PullRequestNumber, opt, options...)
+			pushChanges, resp, err := v.Client().Commits.GetCommitDiff(v.sourceProjectID, runevent.SHA, &options, pageOpts...)
 			if err != nil {
 				return changedfiles.ChangedFiles{}, err
 			}
 
+			for _, change := range pushChanges {
+				changedFiles.All = append(changedFiles.All, change.NewPath)
+				if change.NewFile {
+					changedFiles.Added = append(changedFiles.Added, change.NewPath)
+				}
+				if change.DeletedFile {
+					changedFiles.Deleted = append(changedFiles.Deleted, change.NewPath)
+				}
+				if !change.RenamedFile && !change.DeletedFile && !change.NewFile {
+					changedFiles.Modified = append(changedFiles.Modified, change.NewPath)
+				}
+				if change.RenamedFile {
+					changedFiles.Renamed = append(changedFiles.Renamed, change.NewPath)
+				}
+			}
+
+			if resp.NextLink == "" {
+				// Exit the loop when we've seen all pages.
+				break
+			}
+			// Otherwise, set param to query the next page
+			pageOpts = []gitlab.RequestOptionFunc{
+				gitlab.WithKeysetPaginationParameters(resp.NextLink),
+			}
+		}
+	default:
+		// No action necessary
+	}
+	return changedFiles, nil
+}
+
+func (v *Provider) mergeRequestFilesChanged(runevent *info.Event) (changedfiles.ChangedFiles, error) {
+	diffTruncated, changeCount, err := v.isMergeRequestDiffTruncated(v.targetProjectID, int64(runevent.PullRequestNumber))
+	if err != nil {
+		return changedfiles.ChangedFiles{}, err
+	}
+
+	changedFiles := changedfiles.ChangedFiles{
+		All:     make([]string, 0, changeCount),
+		Added:   []string{},
+		Deleted: []string{},
+		Renamed: []string{},
+	}
+
+	options := []gitlab.RequestOptionFunc{}
+
+	// Only use the repository/compare API if the standard merge_request/diff API endpoint will
+	// return a truncated set of changes. The repository/compare API returns the entire set of
+	// changes without paging, so it can have a significantly heavier memory footprint if used
+	// in all cases.
+	if diffTruncated {
+		compareOpts := &gitlab.CompareOptions{
+			From: &runevent.BaseBranch,
+			To:   &runevent.SHA,
+		}
+		comparison, _, err := v.Client().Repositories.Compare(v.targetProjectID, compareOpts, options...)
+		if err != nil {
+			return changedfiles.ChangedFiles{}, err
+		}
+
+		for _, change := range comparison.Diffs {
+			changedFiles.All = append(changedFiles.All, change.NewPath)
+			if change.NewFile {
+				changedFiles.Added = append(changedFiles.Added, change.NewPath)
+			}
+			if change.DeletedFile {
+				changedFiles.Deleted = append(changedFiles.Deleted, change.NewPath)
+			}
+			if !change.RenamedFile && !change.DeletedFile && !change.NewFile {
+				changedFiles.Modified = append(changedFiles.Modified, change.NewPath)
+			}
+			if change.RenamedFile {
+				changedFiles.Renamed = append(changedFiles.Renamed, change.NewPath)
+			}
+		}
+	} else {
+		diffOpts := &gitlab.ListMergeRequestDiffsOptions{
+			ListOptions: gitlab.ListOptions{
+				OrderBy:    "id",
+				Pagination: "keyset",
+				PerPage:    defaultGitlabListOptions.PerPage,
+				Sort:       "asc",
+			},
+		}
+		for {
+			mrchanges, resp, err := v.Client().MergeRequests.ListMergeRequestDiffs(v.targetProjectID, int64(runevent.PullRequestNumber), diffOpts, options...)
+			if err != nil {
+				// TODO: Should this return the files found so far?
+				return changedfiles.ChangedFiles{}, err
+			}
 			for _, change := range mrchanges {
 				changedFiles.All = append(changedFiles.All, change.NewPath)
 				if change.NewFile {
@@ -531,33 +789,29 @@ func (v *Provider) GetFiles(_ context.Context, runevent *info.Event) (changedfil
 				gitlab.WithKeysetPaginationParameters(resp.NextLink),
 			}
 		}
-		return changedFiles, nil
 	}
+	return changedFiles, nil
+}
 
-	if runevent.TriggerTarget == "push" {
-		pushChanges, _, err := v.Client().Commits.GetCommitDiff(v.sourceProjectID, runevent.SHA, &gitlab.GetCommitDiffOptions{})
-		if err != nil {
-			return changedfiles.ChangedFiles{}, err
-		}
-		changedFiles := changedfiles.ChangedFiles{}
-		for _, change := range pushChanges {
-			changedFiles.All = append(changedFiles.All, change.NewPath)
-			if change.NewFile {
-				changedFiles.Added = append(changedFiles.Added, change.NewPath)
-			}
-			if change.DeletedFile {
-				changedFiles.Deleted = append(changedFiles.Deleted, change.NewPath)
-			}
-			if !change.RenamedFile && !change.DeletedFile && !change.NewFile {
-				changedFiles.Modified = append(changedFiles.Modified, change.NewPath)
-			}
-			if change.RenamedFile {
-				changedFiles.Renamed = append(changedFiles.Renamed, change.NewPath)
-			}
-		}
-		return changedFiles, nil
+// isMergeRequestDiffTruncated checks if the merge request is affected by the Gitlab API's Diff Limits.
+// This is determined by the Get Merge Request API's returning a ChangeCount number with a "+" suffix.
+// See also: https://docs.gitlab.com/administration/diff_limits/
+// Returns (bool: isTruncated, int: changeCount, err: error).
+func (v *Provider) isMergeRequestDiffTruncated(projectID, mergeRequestID int64) (bool, int, error) {
+	out, _, err := v.Client().MergeRequests.GetMergeRequest(projectID, mergeRequestID, &gitlab.GetMergeRequestsOptions{})
+	if err != nil {
+		return false, 0, fmt.Errorf("error getting merge request %d: %w", mergeRequestID, err)
 	}
-	return changedfiles.ChangedFiles{}, nil
+	fileCount := 0
+	truncated := strings.HasSuffix(out.ChangesCount, "+")
+	if out.ChangesCount != "" {
+		countStr := strings.TrimSuffix(out.ChangesCount, "+")
+		fileCount, err = strconv.Atoi(countStr)
+		if err != nil {
+			return false, 0, err
+		}
+	}
+	return truncated, fileCount, nil
 }
 
 func (v *Provider) CreateToken(_ context.Context, _ []string, _ *info.Event) (string, error) {
@@ -584,4 +838,25 @@ func (v *Provider) isHeadCommitOfBranch(runevent *info.Event, branchName string)
 
 func (v *Provider) GetTemplate(commentType provider.CommentType) string {
 	return provider.GetHTMLTemplate(commentType)
+}
+
+//nolint:misspell
+func (v *Provider) formatPipelineComment(sha string, status providerstatus.StatusOpts) string {
+	var emoji string
+
+	switch status.Conclusion {
+	case "canceled":
+		emoji = "⚠️"
+	case "failed":
+		emoji = "❌"
+	case "success":
+		emoji = "✅"
+	case "running":
+		emoji = "🚀"
+	default:
+		emoji = "ℹ️"
+	}
+
+	return fmt.Sprintf("%s **%s: %s/%s for %s**\n\n%s\n\n<small>Full log available [here](%s)</small>",
+		emoji, status.Title, v.pacInfo.ApplicationName, status.OriginalPipelineRunName, sha, status.Text, status.DetailsURL)
 }
