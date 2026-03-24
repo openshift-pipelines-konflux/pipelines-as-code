@@ -11,6 +11,7 @@ import (
 	"github.com/openshift-pipelines/pipelines-as-code/pkg/params"
 	"github.com/openshift-pipelines/pipelines-as-code/pkg/params/info"
 	"github.com/openshift-pipelines/pipelines-as-code/pkg/provider"
+	providerstatus "github.com/openshift-pipelines/pipelines-as-code/pkg/provider/status"
 	"go.uber.org/zap"
 )
 
@@ -30,7 +31,10 @@ type TestProviderImp struct {
 	WantDeletedFiles       []string
 	WantModifiedFiles      []string
 	WantRenamedFiles       []string
+	FailGetCommitInfo      bool
+	CommitInfoErrorMsg     string
 	pacInfo                *info.PacOpts
+	CommitStatuses         []provider.CommitStatusInfo
 }
 
 func (v *TestProviderImp) SetPacInfo(pacInfo *info.PacOpts) {
@@ -71,7 +75,18 @@ func (v *TestProviderImp) GetConfig() *info.ProviderConfig {
 	return &info.ProviderConfig{}
 }
 
-func (v *TestProviderImp) GetCommitInfo(_ context.Context, _ *info.Event) error {
+func (v *TestProviderImp) GetCommitInfo(_ context.Context, event *info.Event) error {
+	if v.FailGetCommitInfo {
+		if v.CommitInfoErrorMsg != "" {
+			return fmt.Errorf("%s", v.CommitInfoErrorMsg)
+		}
+		return fmt.Errorf("failed to get commit info")
+	}
+	// Simulate what real providers do: set HasSkipCommand based on commit message
+	// Real providers set this from the commit message fetched via API
+	if event.SHATitle != "" {
+		event.HasSkipCommand = provider.SkipCI(event.SHATitle)
+	}
 	return nil
 }
 
@@ -90,7 +105,7 @@ func (v *TestProviderImp) GetTaskURI(_ context.Context, _ *info.Event, _ string)
 	return v.WantProviderRemoteTask, "", nil
 }
 
-func (v *TestProviderImp) CreateStatus(_ context.Context, _ *info.Event, _ provider.StatusOpts) error {
+func (v *TestProviderImp) CreateStatus(_ context.Context, _ *info.Event, _ providerstatus.StatusOpts) error {
 	if v.CreateStatusErorring {
 		return fmt.Errorf("some provider error occurred while reporting status")
 	}
@@ -127,4 +142,8 @@ func (v *TestProviderImp) CreateToken(_ context.Context, _ []string, _ *info.Eve
 
 func (v *TestProviderImp) GetTemplate(commentType provider.CommentType) string {
 	return provider.GetHTMLTemplate(commentType)
+}
+
+func (v *TestProviderImp) GetCommitStatuses(_ context.Context, _ *info.Event) ([]provider.CommitStatusInfo, error) {
+	return v.CommitStatuses, nil
 }

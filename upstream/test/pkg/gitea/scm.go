@@ -9,8 +9,8 @@ import (
 	"regexp"
 	"testing"
 
-	"code.gitea.io/sdk/gitea"
-	"github.com/google/go-github/v74/github"
+	"codeberg.org/mvdkleijn/forgejo-sdk/forgejo/v3"
+	"github.com/google/go-github/v81/github"
 	"github.com/openshift-pipelines/pipelines-as-code/pkg/git"
 	pgitea "github.com/openshift-pipelines/pipelines-as-code/pkg/provider/gitea"
 	"github.com/openshift-pipelines/pipelines-as-code/test/pkg/payload"
@@ -53,13 +53,13 @@ func PushFilesToRefAPI(t *testing.T, topts *TestOpts, entries map[string]string)
 			fromBranch = topts.DefaultBranch
 			firstOne = false
 		}
-		fOpts := gitea.CreateFileOptions{
+		fOpts := forgejo.CreateFileOptions{
 			Content: bContent,
-			FileOptions: gitea.FileOptions{
+			FileOptions: forgejo.FileOptions{
 				Message:       "Committing " + filename,
 				BranchName:    fromBranch,
 				NewBranchName: topts.TargetRefName,
-				Author:        gitea.Identity{Name: commitAuthor, Email: commitEmail},
+				Author:        forgejo.Identity{Name: commitAuthor, Email: commitEmail},
 			},
 		}
 		fr, _, err := topts.GiteaCNX.Client().CreateFile(topts.Opts.Organization, topts.Opts.Repo, filename, fOpts)
@@ -106,21 +106,40 @@ func GetIssueTimeline(ctx context.Context, topts *TestOpts) (Timelines, error) {
 	return tls, nil
 }
 
-func CreateGiteaRepo(giteaClient *gitea.Client, user, name, defaultBranch, hookURL string, onOrg bool, logger *zap.SugaredLogger) (*gitea.Repository, error) {
-	var repo *gitea.Repository
+func CreateGiteaRepo(giteaClient *forgejo.Client, user, name, defaultBranch, hookURL, webhookSecret string, onOrg bool, logger *zap.SugaredLogger) (*forgejo.Repository, error) {
+	var repo *forgejo.Repository
 	var err error
 	// Create a new repo
 	if onOrg {
 		logger.Infof("Creating org %s", name)
+		adminUser := user
 		user = "org-" + name
-		_, _, err := giteaClient.CreateOrg(gitea.CreateOrgOption{
+		_, _, err := giteaClient.CreateOrg(forgejo.CreateOrgOption{
 			Name: user,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("failed to create org: %w", err)
 		}
+		// Ensure admin user is in the Owners team so that ListOrgTeams works
+		// with the admin token (Forgejo 13+ requires org membership).
+		teams, _, listErr := giteaClient.ListOrgTeams(user, forgejo.ListTeamsOptions{})
+		if listErr != nil {
+			logger.Warnf("failed to list org teams for %s: %v", user, listErr)
+		} else {
+			for _, team := range teams {
+				if team.Name == "Owners" {
+					_, addErr := giteaClient.AddTeamMember(team.ID, adminUser)
+					if addErr != nil {
+						logger.Warnf("failed to add user %s to Owners team in org %s: %v", adminUser, user, addErr)
+					} else {
+						logger.Infof("added user %s to Owners team in org %s", adminUser, user)
+					}
+					break
+				}
+			}
+		}
 		logger.Infof("Creating gitea repository on org %s", name)
-		repo, _, err = giteaClient.CreateOrgRepo(user, gitea.CreateRepoOption{
+		repo, _, err = giteaClient.CreateOrgRepo(user, forgejo.CreateRepoOption{
 			Name:        name,
 			Description: "This is a repo it's a wonderful thing",
 			AutoInit:    true,
@@ -130,7 +149,7 @@ func CreateGiteaRepo(giteaClient *gitea.Client, user, name, defaultBranch, hookU
 		}
 	} else {
 		logger.Infof("Creating gitea repository %s for user %s", name, user)
-		repo, _, err = giteaClient.AdminCreateRepo(user, gitea.CreateRepoOption{
+		repo, _, err = giteaClient.AdminCreateRepo(user, forgejo.CreateRepoOption{
 			Name:          name,
 			Description:   "This is a repo it's a wonderful thing",
 			AutoInit:      true,
@@ -142,21 +161,23 @@ func CreateGiteaRepo(giteaClient *gitea.Client, user, name, defaultBranch, hookU
 		return nil, fmt.Errorf("failed to create repo: %w", err)
 	}
 	logger.Infof("Creating webhook to smee url on gitea repository %s", name)
-	_, _, err = giteaClient.CreateRepoHook(user, repo.Name, gitea.CreateHookOption{
+	_, _, err = giteaClient.CreateRepoHook(user, repo.Name, forgejo.CreateHookOption{
+		// Forgejo still uses the "gitea" hook type for webhooks.
 		Type:   "gitea",
 		Active: true,
 		Config: map[string]string{
 			"name":         "hook to smee url",
 			"url":          hookURL,
 			"content_type": "json",
+			"secret":       webhookSecret,
 		},
 		Events: []string{"push", "issue_comments", "pull_request"},
 	})
 	return repo, err
 }
 
-func GetGiteaRepo(giteaClient *gitea.Client, user, name string, _ *zap.SugaredLogger) (*gitea.Repository, error) {
-	var repo *gitea.Repository
+func GetGiteaRepo(giteaClient *forgejo.Client, user, name string, _ *zap.SugaredLogger) (*forgejo.Repository, error) {
+	var repo *forgejo.Repository
 	var err error
 	repo, _, err = giteaClient.GetRepo(user, name)
 	if err != nil {
@@ -165,20 +186,23 @@ func GetGiteaRepo(giteaClient *gitea.Client, user, name string, _ *zap.SugaredLo
 	return repo, err
 }
 
-func CreateTeam(topts *TestOpts, orgName, teamName string) (*gitea.Team, error) {
-	team, _, err := topts.GiteaCNX.Client().CreateTeam(orgName, gitea.CreateTeamOption{
-		Permission: gitea.AccessModeWrite,
-		Units: []gitea.RepoUnitType{
-			gitea.RepoUnitPulls,
+func CreateTeam(topts *TestOpts, orgName, teamName string) (*forgejo.Team, error) {
+	team, _, err := topts.GiteaCNX.Client().CreateTeam(orgName, forgejo.CreateTeamOption{
+		Permission: forgejo.AccessModeWrite,
+		UnitsMap: map[string]string{
+			string(forgejo.RepoUnitPulls): "write",
 		},
 		Name: teamName,
 	})
+	if err != nil {
+		return nil, err
+	}
 	topts.ParamsRun.Clients.Log.Infof("Team %s has been created on Org %s", team.Name, orgName)
-	return team, err
+	return team, nil
 }
 
 func RemoveCommentMatching(topts *TestOpts, commentString *regexp.Regexp) error {
-	comments, _, err := topts.GiteaCNX.Client().ListIssueComments(topts.Opts.Organization, topts.Opts.Repo, topts.PullRequest.Index, gitea.ListIssueCommentOptions{})
+	comments, _, err := topts.GiteaCNX.Client().ListIssueComments(topts.Opts.Organization, topts.Opts.Repo, topts.PullRequest.Index, forgejo.ListIssueCommentOptions{})
 	if err != nil {
 		return err
 	}
@@ -192,9 +216,9 @@ func RemoveCommentMatching(topts *TestOpts, commentString *regexp.Regexp) error 
 	return fmt.Errorf("no comment matching %s found", commentString.String())
 }
 
-func CreateGiteaUser(giteaClient *gitea.Client, username, password string) (*gitea.User, error) {
-	visibility := gitea.VisibleTypePublic
-	opts := gitea.CreateUserOption{
+func CreateGiteaUser(giteaClient *forgejo.Client, username, password string) (*forgejo.User, error) {
+	visibility := forgejo.VisibleTypePublic
+	opts := forgejo.CreateUserOption{
 		LoginName:          username,
 		Username:           username,
 		Email:              username + "@redhat.com",
@@ -204,13 +228,13 @@ func CreateGiteaUser(giteaClient *gitea.Client, username, password string) (*git
 	}
 	newuser, _, err := giteaClient.AdminCreateUser(opts)
 	if err != nil {
-		return &gitea.User{}, err
+		return &forgejo.User{}, err
 	}
 	return newuser, nil
 }
 
 // CreateGiteaUserSecondCnx creates a new user and a new provider for this user.
-func CreateGiteaUserSecondCnx(topts *TestOpts, username, password string) (pgitea.Provider, *gitea.User, error) {
+func CreateGiteaUserSecondCnx(topts *TestOpts, username, password string) (pgitea.Provider, *forgejo.User, error) {
 	newuser, err := CreateGiteaUser(topts.GiteaCNX.Client(), username, password)
 	if err != nil {
 		return pgitea.Provider{}, newuser, fmt.Errorf("failed to create user: %w", err)
@@ -222,9 +246,9 @@ func CreateGiteaUserSecondCnx(topts *TestOpts, username, password string) (pgite
 	return secondprovider, newuser, err
 }
 
-func CreateForkPullRequest(t *testing.T, topts *TestOpts, secondcnx pgitea.Provider, accessMode string) *gitea.PullRequest {
+func CreateForkPullRequest(t *testing.T, topts *TestOpts, secondcnx pgitea.Provider, accessMode string) *forgejo.PullRequest {
 	forkrepo, _, err := secondcnx.Client().CreateFork(topts.Opts.Organization, topts.TargetRefName,
-		gitea.CreateForkOption{})
+		forgejo.CreateForkOption{})
 	assert.NilError(t, err)
 	topts.ParamsRun.Clients.Log.Infof("Forked repository %s has been created", forkrepo.CloneURL)
 
@@ -233,7 +257,7 @@ func CreateForkPullRequest(t *testing.T, topts *TestOpts, secondcnx pgitea.Provi
 	}
 
 	pr, _, err := secondcnx.Client().CreatePullRequest(topts.Opts.Organization, topts.TargetRefName,
-		gitea.CreatePullRequestOption{
+		forgejo.CreatePullRequestOption{
 			Base:  topts.DefaultBranch,
 			Head:  fmt.Sprintf("%s:%s", forkrepo.Owner.UserName, topts.TargetRefName),
 			Title: fmt.Sprintf("New PR from %s", topts.TargetRefName),
@@ -268,9 +292,9 @@ func PushToPullRequest(t *testing.T, topts *TestOpts, secondcnx pgitea.Provider,
 }
 
 func CreateAccess(topts *TestOpts, touser, accessMode string) error {
-	accessmode := gitea.AccessMode(accessMode)
+	accessmode := forgejo.AccessMode(accessMode)
 	_, err := topts.GiteaCNX.Client().AddCollaborator(topts.Opts.Organization, topts.Opts.Repo, touser,
-		gitea.AddCollaboratorOption{
+		forgejo.AddCollaboratorOption{
 			Permission: &accessmode,
 		})
 	return err

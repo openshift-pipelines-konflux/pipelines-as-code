@@ -4,6 +4,7 @@ kind: PipelineRun
 metadata:
   name: "pipelinerun-on-tag"
   annotations:
+    pipelinesascode.tekton.dev/target-namespace: "\\ .TargetNamespace //"
     pipelinesascode.tekton.dev/on-target-branch: "[\\ .TargetBranch //]"
     pipelinesascode.tekton.dev/on-event: "[push]"
 spec:
@@ -13,7 +14,7 @@ spec:
         taskSpec:
           steps:
             - name: task
-              image: registry.access.redhat.com/ubi9/ubi-micro
+              image: registry.access.redhat.com/ubi10/ubi-micro
               script: |
                 echo "HELLOMOTO"
                 sleep 30

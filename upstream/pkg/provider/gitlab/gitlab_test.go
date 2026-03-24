@@ -6,9 +6,12 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/openshift-pipelines/pipelines-as-code/pkg/apis/pipelinesascode/v1alpha1"
 	"github.com/openshift-pipelines/pipelines-as-code/pkg/events"
 	"github.com/openshift-pipelines/pipelines-as-code/pkg/opscomments"
 	"github.com/openshift-pipelines/pipelines-as-code/pkg/params"
@@ -18,13 +21,17 @@ import (
 	"github.com/openshift-pipelines/pipelines-as-code/pkg/params/triggertype"
 	"github.com/openshift-pipelines/pipelines-as-code/pkg/provider"
 	thelp "github.com/openshift-pipelines/pipelines-as-code/pkg/provider/gitlab/test"
+	providerstatus "github.com/openshift-pipelines/pipelines-as-code/pkg/provider/status"
 	testclient "github.com/openshift-pipelines/pipelines-as-code/pkg/test/clients"
 	"github.com/openshift-pipelines/pipelines-as-code/pkg/test/logger"
+	metricsutils "github.com/openshift-pipelines/pipelines-as-code/pkg/test/metricstest"
 
 	gitlab "gitlab.com/gitlab-org/api/client-go"
 	"go.uber.org/zap"
 	zapobserver "go.uber.org/zap/zaptest/observer"
 	"gotest.tools/v3/assert"
+	"knative.dev/pkg/metrics/metricstest"
+	_ "knative.dev/pkg/metrics/testing"
 	rtesting "knative.dev/pkg/reconciler/testing"
 )
 
@@ -34,7 +41,7 @@ func TestCreateStatus(t *testing.T) {
 	}
 	type args struct {
 		event      *info.Event
-		statusOpts provider.StatusOpts
+		statusOpts providerstatus.StatusOpts
 		postStr    string
 	}
 	tests := []struct {
@@ -53,7 +60,7 @@ func TestCreateStatus(t *testing.T) {
 			wantClient: true,
 			wantErr:    false,
 			args: args{
-				statusOpts: provider.StatusOpts{
+				statusOpts: providerstatus.StatusOpts{
 					Status: "in_progress",
 				},
 			},
@@ -63,7 +70,7 @@ func TestCreateStatus(t *testing.T) {
 			wantClient: true,
 			wantErr:    false,
 			args: args{
-				statusOpts: provider.StatusOpts{
+				statusOpts: providerstatus.StatusOpts{
 					Conclusion: "skipped",
 				},
 				event: &info.Event{
@@ -77,7 +84,7 @@ func TestCreateStatus(t *testing.T) {
 			wantClient: true,
 			wantErr:    false,
 			args: args{
-				statusOpts: provider.StatusOpts{
+				statusOpts: providerstatus.StatusOpts{
 					Conclusion: "neutral",
 				},
 				event: &info.Event{
@@ -91,7 +98,7 @@ func TestCreateStatus(t *testing.T) {
 			wantClient: true,
 			wantErr:    false,
 			args: args{
-				statusOpts: provider.StatusOpts{
+				statusOpts: providerstatus.StatusOpts{
 					Conclusion: "failure",
 				},
 				event: &info.Event{
@@ -105,7 +112,7 @@ func TestCreateStatus(t *testing.T) {
 			wantClient: true,
 			wantErr:    false,
 			args: args{
-				statusOpts: provider.StatusOpts{
+				statusOpts: providerstatus.StatusOpts{
 					Conclusion: "success",
 				},
 				event: &info.Event{
@@ -119,7 +126,7 @@ func TestCreateStatus(t *testing.T) {
 			wantClient: true,
 			wantErr:    false,
 			args: args{
-				statusOpts: provider.StatusOpts{
+				statusOpts: providerstatus.StatusOpts{
 					Conclusion: "pending",
 				},
 				event: &info.Event{
@@ -133,7 +140,7 @@ func TestCreateStatus(t *testing.T) {
 			wantClient: true,
 			wantErr:    false,
 			args: args{
-				statusOpts: provider.StatusOpts{
+				statusOpts: providerstatus.StatusOpts{
 					Conclusion: "completed",
 				},
 				event: &info.Event{
@@ -147,7 +154,7 @@ func TestCreateStatus(t *testing.T) {
 			wantClient: true,
 			wantErr:    false,
 			args: args{
-				statusOpts: provider.StatusOpts{
+				statusOpts: providerstatus.StatusOpts{
 					Conclusion: "cancelled",
 				},
 				event: &info.Event{
@@ -161,7 +168,7 @@ func TestCreateStatus(t *testing.T) {
 			wantClient: true,
 			wantErr:    false,
 			args: args{
-				statusOpts: provider.StatusOpts{
+				statusOpts: providerstatus.StatusOpts{
 					Conclusion: "completed",
 				},
 				event: &info.Event{
@@ -175,7 +182,7 @@ func TestCreateStatus(t *testing.T) {
 			wantClient: true,
 			wantErr:    false,
 			args: args{
-				statusOpts: provider.StatusOpts{
+				statusOpts: providerstatus.StatusOpts{
 					Conclusion: "skipped",
 					DetailsURL: "https://url.com",
 				},
@@ -190,7 +197,7 @@ func TestCreateStatus(t *testing.T) {
 			wantClient: true,
 			wantErr:    false,
 			args: args{
-				statusOpts: provider.StatusOpts{
+				statusOpts: providerstatus.StatusOpts{
 					Conclusion: "pending",
 				},
 				event: &info.Event{
@@ -205,7 +212,7 @@ func TestCreateStatus(t *testing.T) {
 			wantClient: true,
 			wantErr:    false,
 			args: args{
-				statusOpts: provider.StatusOpts{
+				statusOpts: providerstatus.StatusOpts{
 					Conclusion: "completed",
 				},
 				event: &info.Event{
@@ -223,7 +230,7 @@ func TestCreateStatus(t *testing.T) {
 				targetProjectID: 100,
 			},
 			args: args{
-				statusOpts: provider.StatusOpts{
+				statusOpts: providerstatus.StatusOpts{
 					Conclusion: "success",
 				},
 				event: &info.Event{
@@ -243,7 +250,7 @@ func TestCreateStatus(t *testing.T) {
 				targetProjectID: 100,
 			},
 			args: args{
-				statusOpts: provider.StatusOpts{
+				statusOpts: providerstatus.StatusOpts{
 					Conclusion: "success",
 				},
 				event: &info.Event{
@@ -256,21 +263,81 @@ func TestCreateStatus(t *testing.T) {
 			},
 		},
 		{
-			name:       "commit status fails on both projects but continues",
+			name:       "commit status fails with state transition error skips MR comment",
 			wantClient: true,
 			wantErr:    false,
 			fields: fields{
 				targetProjectID: 100,
 			},
 			args: args{
-				statusOpts: provider.StatusOpts{
+				statusOpts: providerstatus.StatusOpts{
 					Conclusion: "success",
 				},
 				event: &info.Event{
 					TriggerTarget:   "pull_request",
-					SourceProjectID: 404, // Will fail
-					TargetProjectID: 405, // Will fail
+					SourceProjectID: 404, // Will fail with 404 Not Found
+					TargetProjectID: 422, // Will fail with "Cannot transition status" error
 					SHA:             "abc123",
+				},
+				postStr: "", // No MR comment expected for state transition errors
+			},
+		},
+		{
+			name:       "generic error on both projects creates MR comment",
+			wantClient: true,
+			wantErr:    false,
+			fields: fields{
+				targetProjectID: 100,
+			},
+			args: args{
+				statusOpts: providerstatus.StatusOpts{
+					Conclusion: "success",
+				},
+				event: &info.Event{
+					TriggerTarget:   "pull_request",
+					SourceProjectID: 400, // Will fail with generic 400 error
+					TargetProjectID: 405, // Will fail with generic 400 error
+					SHA:             "abc123def",
+				},
+				postStr: "has successfully", // MR comment expected for non-transition errors
+			},
+		},
+		{
+			name:       "permission error 403 on source creates MR comment",
+			wantClient: true,
+			wantErr:    false,
+			fields: fields{
+				targetProjectID: 100,
+			},
+			args: args{
+				statusOpts: providerstatus.StatusOpts{
+					Conclusion: "success",
+				},
+				event: &info.Event{
+					TriggerTarget:   "pull_request",
+					SourceProjectID: 403, // Will fail with 403 Forbidden
+					TargetProjectID: 400, // Will fail with generic 400 error
+					SHA:             "abc123ghi",
+				},
+				postStr: "has successfully",
+			},
+		},
+		{
+			name:       "permission error 401 on source creates MR comment",
+			wantClient: true,
+			wantErr:    false,
+			fields: fields{
+				targetProjectID: 100,
+			},
+			args: args{
+				statusOpts: providerstatus.StatusOpts{
+					Conclusion: "success",
+				},
+				event: &info.Event{
+					TriggerTarget:   "pull_request",
+					SourceProjectID: 401, // Will fail with 401 Unauthorized
+					TargetProjectID: 400, // Will fail with generic 400 error
+					SHA:             "abc123jkl",
 				},
 				postStr: "has successfully",
 			},
@@ -288,7 +355,7 @@ func TestCreateStatus(t *testing.T) {
 				},
 			}
 			v := &Provider{
-				targetProjectID: tt.fields.targetProjectID,
+				targetProjectID: int64(tt.fields.targetProjectID),
 				run:             params.New(),
 				Logger:          logger,
 				pacInfo: &info.PacOpts{
@@ -313,15 +380,26 @@ func TestCreateStatus(t *testing.T) {
 					// Mock source project commit status endpoint
 					sourceStatusPath := fmt.Sprintf("/projects/%d/statuses/%s", tt.args.event.SourceProjectID, tt.args.event.SHA)
 					mux.HandleFunc(sourceStatusPath, func(rw http.ResponseWriter, _ *http.Request) {
-						if tt.args.event.SourceProjectID == 404 {
-							// Simulate failure on source project
+						switch tt.args.event.SourceProjectID {
+						case 400:
+							rw.WriteHeader(http.StatusBadRequest)
+							fmt.Fprint(rw, `{"message": "400 Bad Request"}`)
+						case 401:
+							rw.WriteHeader(http.StatusUnauthorized)
+							fmt.Fprint(rw, `{"message": "401 Unauthorized"}`)
+						case 403:
+							rw.WriteHeader(http.StatusForbidden)
+							fmt.Fprint(rw, `{"message": "403 Forbidden"}`)
+						case 404:
 							rw.WriteHeader(http.StatusNotFound)
 							fmt.Fprint(rw, `{"message": "404 Project Not Found"}`)
-							return
+						case 422:
+							rw.WriteHeader(http.StatusBadRequest)
+							fmt.Fprint(rw, `{"message": "Cannot transition status via :run from :running"}`)
+						default:
+							rw.WriteHeader(http.StatusCreated)
+							fmt.Fprint(rw, `{}`)
 						}
-						// Success on source project
-						rw.WriteHeader(http.StatusCreated)
-						fmt.Fprint(rw, `{}`)
 					})
 				}
 
@@ -329,19 +407,30 @@ func TestCreateStatus(t *testing.T) {
 					// Mock target project commit status endpoint
 					targetStatusPath := fmt.Sprintf("/projects/%d/statuses/%s", tt.args.event.TargetProjectID, tt.args.event.SHA)
 					mux.HandleFunc(targetStatusPath, func(rw http.ResponseWriter, _ *http.Request) {
-						if tt.args.event.TargetProjectID == 404 {
-							// Simulate failure on target project
+						switch tt.args.event.TargetProjectID {
+						case 400, 405:
+							rw.WriteHeader(http.StatusBadRequest)
+							fmt.Fprint(rw, `{"message": "400 Bad Request"}`)
+						case 401:
+							rw.WriteHeader(http.StatusUnauthorized)
+							fmt.Fprint(rw, `{"message": "401 Unauthorized"}`)
+						case 403:
+							rw.WriteHeader(http.StatusForbidden)
+							fmt.Fprint(rw, `{"message": "403 Forbidden"}`)
+						case 404:
 							rw.WriteHeader(http.StatusNotFound)
 							fmt.Fprint(rw, `{"message": "404 Project Not Found"}`)
-							return
+						case 422:
+							rw.WriteHeader(http.StatusBadRequest)
+							fmt.Fprint(rw, `{"message": "Cannot transition status via :run from :running"}`)
+						default:
+							rw.WriteHeader(http.StatusCreated)
+							fmt.Fprint(rw, `{}`)
 						}
-						// Success on target project
-						rw.WriteHeader(http.StatusCreated)
-						fmt.Fprint(rw, `{}`)
 					})
 				}
 
-				thelp.MuxNotePost(t, mux, v.targetProjectID, tt.args.event.PullRequestNumber, tt.args.postStr)
+				thelp.MuxNotePost(t, mux, int(v.targetProjectID), tt.args.event.PullRequestNumber, tt.args.postStr)
 			}
 
 			if err := v.CreateStatus(ctx, tt.args.event, tt.args.statusOpts); (err != nil) != tt.wantErr {
@@ -352,15 +441,236 @@ func TestCreateStatus(t *testing.T) {
 }
 
 func TestGetCommitInfo(t *testing.T) {
-	ctx, _ := rtesting.SetupFakeContext(t)
-	client, _, tearDown := thelp.Setup(t)
-	v := &Provider{gitlabClient: client}
+	tests := []struct {
+		name                string
+		event               *info.Event
+		sourceProjectID     int
+		mockCommitResponse  string
+		wantErr             bool
+		wantSHATitle        string
+		wantSHAURL          string
+		wantSHAMessage      string
+		wantAuthorName      string
+		wantAuthorEmail     string
+		wantAuthorDate      string
+		wantCommitterName   string
+		wantCommitterEmail  string
+		wantCommitterDate   string
+		checkExtendedFields bool
+		noClient            bool
+	}{
+		{
+			name: "good with full commit info",
+			event: &info.Event{
+				HeadBranch: "feature-branch",
+			},
+			sourceProjectID: 123,
+			mockCommitResponse: `{
+				"id": "abc123",
+				"title": "feat: add new feature",
+				"message": "feat: add new feature\n\nThis is the full commit message with details.",
+				"web_url": "https://gitlab.com/owner/repo/-/commit/abc123",
+				"author_name": "John Doe",
+				"author_email": "john@example.com",
+				"authored_date": "2024-01-15T10:30:00Z",
+				"committer_name": "GitLab",
+				"committer_email": "noreply@gitlab.com",
+				"committed_date": "2024-01-15T10:31:00Z"
+			}`,
+			wantSHATitle:        "feat: add new feature",
+			wantSHAURL:          "https://gitlab.com/owner/repo/-/commit/abc123",
+			wantSHAMessage:      "feat: add new feature\n\nThis is the full commit message with details.",
+			wantAuthorName:      "John Doe",
+			wantAuthorEmail:     "john@example.com",
+			wantAuthorDate:      "2024-01-15T10:30:00Z",
+			wantCommitterName:   "GitLab",
+			wantCommitterEmail:  "noreply@gitlab.com",
+			wantCommitterDate:   "2024-01-15T10:31:00Z",
+			checkExtendedFields: true,
+		},
+		{
+			name: "basic fields only",
+			event: &info.Event{
+				HeadBranch: "main",
+			},
+			sourceProjectID: 123,
+			mockCommitResponse: `{
+				"id": "def456",
+				"title": "fix: simple fix",
+				"message": "fix: simple fix",
+				"web_url": "https://gitlab.com/owner/repo/-/commit/def456"
+			}`,
+			wantSHATitle:   "fix: simple fix",
+			wantSHAURL:     "https://gitlab.com/owner/repo/-/commit/def456",
+			wantSHAMessage: "fix: simple fix",
+		},
+		{
+			name: "no client error",
+			event: &info.Event{
+				HeadBranch: "main",
+			},
+			noClient: true,
+			wantErr:  true,
+		},
+		{
+			name: "no SHA, no HeadBranch - no API call",
+			event: &info.Event{
+				SHA: "already-set",
+			},
+			sourceProjectID: 123,
+		},
+	}
 
-	defer tearDown()
-	assert.NilError(t, v.GetCommitInfo(ctx, info.NewEvent()))
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, _ := rtesting.SetupFakeContext(t)
 
-	ncv := &Provider{}
-	assert.Assert(t, ncv.GetCommitInfo(ctx, info.NewEvent()) != nil)
+			var provider *Provider
+			if !tt.noClient {
+				client, mux, tearDown := thelp.Setup(t)
+				defer tearDown()
+
+				// Mock the GetCommit API endpoint if we expect it to be called
+				if tt.event.SHA == "" && tt.event.HeadBranch != "" {
+					mux.HandleFunc(fmt.Sprintf("/projects/%d/repository/commits/%s", tt.sourceProjectID, tt.event.HeadBranch),
+						func(rw http.ResponseWriter, _ *http.Request) {
+							fmt.Fprint(rw, tt.mockCommitResponse)
+						})
+				}
+
+				provider = &Provider{
+					gitlabClient:    client,
+					sourceProjectID: int64(tt.sourceProjectID),
+				}
+			} else {
+				provider = &Provider{}
+			}
+
+			err := provider.GetCommitInfo(ctx, tt.event)
+
+			if tt.wantErr {
+				assert.Assert(t, err != nil, "expected error but got nil")
+				return
+			}
+
+			assert.NilError(t, err)
+
+			// Only check fields if API was supposed to be called
+			if tt.event.SHA == "" && tt.event.HeadBranch != "" {
+				assert.Equal(t, tt.wantSHATitle, tt.event.SHATitle, "SHATitle should match")
+				assert.Equal(t, tt.wantSHAURL, tt.event.SHAURL, "SHAURL should match")
+				assert.Equal(t, tt.wantSHAMessage, tt.event.SHAMessage, "SHAMessage should match")
+
+				if tt.checkExtendedFields {
+					assert.Equal(t, tt.wantAuthorName, tt.event.SHAAuthorName, "SHAAuthorName should match")
+					assert.Equal(t, tt.wantAuthorEmail, tt.event.SHAAuthorEmail, "SHAAuthorEmail should match")
+					assert.Equal(t, tt.wantCommitterName, tt.event.SHACommitterName, "SHACommitterName should match")
+					assert.Equal(t, tt.wantCommitterEmail, tt.event.SHACommitterEmail, "SHACommitterEmail should match")
+
+					// Verify dates are parsed correctly
+					if tt.wantAuthorDate != "" {
+						expectedAuthorDate, _ := time.Parse(time.RFC3339, tt.wantAuthorDate)
+						assert.DeepEqual(t, expectedAuthorDate, tt.event.SHAAuthorDate)
+					}
+					if tt.wantCommitterDate != "" {
+						expectedCommitterDate, _ := time.Parse(time.RFC3339, tt.wantCommitterDate)
+						assert.DeepEqual(t, expectedCommitterDate, tt.event.SHACommitterDate)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestGetCommitStatuses(t *testing.T) {
+	tests := []struct {
+		name         string
+		event        *info.Event
+		provider     *Provider
+		mockHandlers map[string]func(http.ResponseWriter, *http.Request)
+		want         []provider.CommitStatusInfo
+	}{
+		{
+			name: "uses event source project statuses",
+			event: &info.Event{
+				SHA:             "abc123",
+				SourceProjectID: 101,
+				TargetProjectID: 202,
+			},
+			provider: &Provider{},
+			mockHandlers: map[string]func(http.ResponseWriter, *http.Request){
+				"/projects/101/repository/commits/abc123/statuses": func(rw http.ResponseWriter, r *http.Request) {
+					assert.Equal(t, r.Method, http.MethodGet)
+					fmt.Fprint(rw, `[{"name":"Pipelines as Code CI / always-good-pipelinerun","status":"success"},{"name":"Pipelines as Code CI / pipelinerun-exit-1","status":"failed"}]`)
+				},
+			},
+			want: []provider.CommitStatusInfo{
+				{Name: "Pipelines as Code CI / always-good-pipelinerun", Status: "success"},
+				{Name: "Pipelines as Code CI / pipelinerun-exit-1", Status: "failed"},
+			},
+		},
+		{
+			name: "falls back to provider source project id when event source project id is empty",
+			event: &info.Event{
+				SHA:             "def456",
+				TargetProjectID: 202,
+			},
+			provider: &Provider{
+				sourceProjectID: 303,
+			},
+			mockHandlers: map[string]func(http.ResponseWriter, *http.Request){
+				"/projects/303/repository/commits/def456/statuses": func(rw http.ResponseWriter, r *http.Request) {
+					assert.Equal(t, r.Method, http.MethodGet)
+					fmt.Fprint(rw, `[{"name":"Pipelines as Code CI / from-provider-source","status":"success"}]`)
+				},
+			},
+			want: []provider.CommitStatusInfo{
+				{Name: "Pipelines as Code CI / from-provider-source", Status: "success"},
+			},
+		},
+		{
+			name: "falls back to target project when source project lookup fails",
+			event: &info.Event{
+				SHA:             "fedcba",
+				SourceProjectID: 404,
+				TargetProjectID: 505,
+			},
+			provider: &Provider{},
+			mockHandlers: map[string]func(http.ResponseWriter, *http.Request){
+				"/projects/404/repository/commits/fedcba/statuses": func(rw http.ResponseWriter, r *http.Request) {
+					assert.Equal(t, r.Method, http.MethodGet)
+					rw.WriteHeader(http.StatusNotFound)
+					fmt.Fprint(rw, `{"message":"404 Project Not Found"}`)
+				},
+				"/projects/505/repository/commits/fedcba/statuses": func(rw http.ResponseWriter, r *http.Request) {
+					assert.Equal(t, r.Method, http.MethodGet)
+					fmt.Fprint(rw, `[{"name":"Pipelines as Code CI / from-target","status":"success"}]`)
+				},
+			},
+			want: []provider.CommitStatusInfo{
+				{Name: "Pipelines as Code CI / from-target", Status: "success"},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fakeclient, mux, tearDown := thelp.Setup(t)
+			defer tearDown()
+			logger, _ := logger.GetLogger()
+
+			for endpoint, handler := range tt.mockHandlers {
+				mux.HandleFunc(endpoint, handler)
+			}
+
+			tt.provider.gitlabClient = fakeclient
+			tt.provider.Logger = logger
+
+			got, err := tt.provider.GetCommitStatuses(context.Background(), tt.event)
+			assert.NilError(t, err)
+			assert.DeepEqual(t, got, tt.want)
+		})
+	}
 }
 
 func TestGetConfig(t *testing.T) {
@@ -408,6 +718,98 @@ func TestSetClient(t *testing.T) {
 		vv.apiURL, "my-org", "my-repo")
 
 	assert.Equal(t, expected, logs[0].Message)
+}
+
+func TestSetClientFieldsInitializedOnError(t *testing.T) {
+	ctx, _ := rtesting.SetupFakeContext(t)
+	observer, _ := zapobserver.New(zap.InfoLevel)
+	fakelogger := zap.New(observer).Sugar()
+	stdata, _ := testclient.SeedTestData(t, ctx, testclient.Data{})
+	run := &params.Run{
+		Clients: clients.Clients{
+			Kube: stdata.Kube,
+			Log:  fakelogger,
+		},
+	}
+
+	tests := []struct {
+		name              string
+		triggerTarget     triggertype.Trigger
+		sourceProjectID   int
+		setupMockResponse func(*http.ServeMux, int)
+		expectedError     string
+		providerToken     string
+	}{
+		{
+			name:            "Fields initialized even when project access fails",
+			triggerTarget:   triggertype.PullRequest,
+			sourceProjectID: 456,
+			providerToken:   "test-token",
+			setupMockResponse: func(mux *http.ServeMux, projectID int) {
+				path := fmt.Sprintf("/projects/%d", projectID)
+				mux.HandleFunc(path, func(rw http.ResponseWriter, r *http.Request) {
+					if r.Method == http.MethodGet {
+						rw.WriteHeader(http.StatusNotFound)
+						fmt.Fprint(rw, `{"message": "404 Project Not Found"}`)
+					}
+				})
+			},
+			expectedError: "failed to access GitLab source repository ID 456",
+		},
+		{
+			name:            "Fields initialized when invalid URL causes error",
+			triggerTarget:   triggertype.Push,
+			sourceProjectID: 123,
+			providerToken:   "test-token",
+			setupMockResponse: func(_ *http.ServeMux, _ int) {
+				// No mock needed
+			},
+			expectedError: "", // This test will use an invalid URL which gets caught during parsing
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mockClient, mux, tearDown := thelp.Setup(t)
+			defer tearDown()
+
+			if tt.setupMockResponse != nil {
+				tt.setupMockResponse(mux, tt.sourceProjectID)
+			}
+
+			v := &Provider{gitlabClient: mockClient}
+			repo := &v1alpha1.Repository{}
+			repo.SetName("test-repo")
+			eventsEmitter := events.NewEventEmitter(run.Clients.Kube, fakelogger)
+
+			event := &info.Event{
+				Provider: &info.Provider{
+					Token: tt.providerToken,
+				},
+				Organization:    "test-org",
+				Repository:      "test-repo",
+				TriggerTarget:   tt.triggerTarget,
+				SourceProjectID: int64(tt.sourceProjectID),
+				TargetProjectID: 123,
+				EventType:       "pull_request",
+			}
+
+			err := v.SetClient(ctx, run, event, repo, eventsEmitter)
+
+			// The test should verify that even when an error occurs,
+			// the critical fields are initialized to prevent nil pointer crashes
+			if tt.expectedError != "" {
+				assert.Assert(t, err != nil, "expected error but got none")
+				assert.ErrorContains(t, err, tt.expectedError)
+			}
+
+			// This is the key assertion: verify fields are initialized even on error
+			assert.Assert(t, v.run != nil, "v.run should be initialized even on error")
+			assert.Assert(t, v.eventEmitter != nil, "v.eventEmitter should be initialized even on error")
+			assert.Assert(t, v.repo != nil, "v.repo should be initialized even on error")
+			assert.Assert(t, v.triggerEvent != "", "v.triggerEvent should be initialized even on error")
+		})
+	}
 }
 
 func TestSetClientRepositoryAccessCheck(t *testing.T) {
@@ -487,7 +889,7 @@ func TestSetClientRepositoryAccessCheck(t *testing.T) {
 				Organization:    "test-org",
 				Repository:      "test-repo",
 				TriggerTarget:   tt.triggerTarget,
-				SourceProjectID: tt.sourceProjectID,
+				SourceProjectID: int64(tt.sourceProjectID),
 				TargetProjectID: 123,
 			}
 
@@ -799,9 +1201,9 @@ func TestGetTektonDir(t *testing.T) {
 			observer, exporter := zapobserver.New(zap.InfoLevel)
 			fakelogger := zap.New(observer).Sugar()
 			v := &Provider{
-				targetProjectID: tt.fields.targetProjectID,
-				sourceProjectID: tt.fields.sourceProjectID,
-				userID:          tt.fields.userID,
+				targetProjectID: int64(tt.fields.targetProjectID),
+				sourceProjectID: int64(tt.fields.sourceProjectID),
+				userID:          int64(tt.fields.userID),
 				Logger:          fakelogger,
 			}
 			if tt.wantClient {
@@ -847,7 +1249,7 @@ func TestGetFileInsideRepo(t *testing.T) {
 		sourceProjectID: 10,
 		gitlabClient:    client,
 	}
-	thelp.MuxListTektonDir(t, mux, v.sourceProjectID, event.HeadBranch, content, false, false)
+	thelp.MuxListTektonDir(t, mux, int(v.sourceProjectID), event.HeadBranch, content, false, false)
 	got, err := v.GetFileInsideRepo(ctx, event, "pr.yaml", "")
 	assert.NilError(t, err)
 	assert.Equal(t, content, got)
@@ -859,32 +1261,38 @@ func TestGetFileInsideRepo(t *testing.T) {
 func TestValidate(t *testing.T) {
 	tests := []struct {
 		name        string
-		wantErr     bool
+		wantErr     string
 		secretToken string
 		eventToken  string
 	}{
 		{
-			name:        "valid event",
-			wantErr:     false,
+			name:        "valid event with matching tokens",
+			wantErr:     "",
 			secretToken: "test",
 			eventToken:  "test",
 		},
 		{
-			name:        "fail validation, no secret defined",
-			wantErr:     true,
+			name:        "invalid when webhook secret not configured",
+			wantErr:     "no webhook secret configured",
 			secretToken: "",
 			eventToken:  "test",
 		},
 		{
-			name:        "fail validation",
-			wantErr:     true,
+			name:        "invalid when tokens do not match",
+			wantErr:     "token does not match configured secret",
 			secretToken: "secret",
 			eventToken:  "test",
 		},
 		{
-			name:        "fail validation, missing event token",
-			wantErr:     true,
+			name:        "invalid when X-Gitlab-Token header missing",
+			wantErr:     "no X-Gitlab-Token header detected",
 			secretToken: "secret",
+			eventToken:  "",
+		},
+		{
+			name:        "invalid when both token and secret are empty (security fix)",
+			wantErr:     "no X-Gitlab-Token header detected",
+			secretToken: "",
 			eventToken:  "",
 		},
 	}
@@ -903,8 +1311,12 @@ func TestValidate(t *testing.T) {
 				WebhookSecret: tt.secretToken,
 			}
 
-			if err := v.Validate(context.TODO(), nil, event); (err != nil) != tt.wantErr {
-				t.Errorf("Validate() error = %v, wantErr %v", err, tt.wantErr)
+			err := v.Validate(context.TODO(), nil, event)
+			if tt.wantErr != "" {
+				assert.Assert(t, err != nil)
+				assert.ErrorContains(t, err, tt.wantErr)
+			} else {
+				assert.NilError(t, err)
 			}
 		})
 	}
@@ -915,6 +1327,7 @@ func TestGetFiles(t *testing.T) {
 		name                             string
 		event                            *info.Event
 		mrchanges                        []*gitlab.MergeRequestDiff
+		diffAPILimitExceeded             bool
 		pushChanges                      []*gitlab.Diff
 		wantAddedFilesCount              int
 		wantDeletedFilesCount            int
@@ -922,6 +1335,7 @@ func TestGetFiles(t *testing.T) {
 		wantRenamedFilesCount            int
 		sourceProjectID, targetProjectID int
 		wantError                        bool
+		apiCallCount                     int64
 	}{
 		{
 			name: "pull-request",
@@ -930,6 +1344,9 @@ func TestGetFiles(t *testing.T) {
 				Organization:      "pullrequestowner",
 				Repository:        "pullrequestrepository",
 				PullRequestNumber: 10,
+				BaseBranch:        "main",
+				HeadBranch:        "feature",
+				SHA:               "abc123",
 			},
 			mrchanges: []*gitlab.MergeRequestDiff{
 				{
@@ -953,6 +1370,44 @@ func TestGetFiles(t *testing.T) {
 			wantModifiedFilesCount: 1,
 			wantRenamedFilesCount:  1,
 			targetProjectID:        10,
+			apiCallCount:           2,
+		},
+		{
+			name: "merge request exceeding gitlab Diff API",
+			event: &info.Event{
+				TriggerTarget:     "pull_request",
+				Organization:      "pullrequestowner",
+				Repository:        "pullrequestrepository",
+				PullRequestNumber: 10,
+				BaseBranch:        "main",
+				HeadBranch:        "feature",
+				SHA:               "abc123",
+			},
+			mrchanges: []*gitlab.MergeRequestDiff{
+				{
+					NewPath: "modified.yaml",
+				},
+				{
+					NewPath: "added.doc",
+					NewFile: true,
+				},
+				{
+					NewPath:     "removed.yaml",
+					DeletedFile: true,
+				},
+				{
+					NewPath:     "renamed.doc",
+					RenamedFile: true,
+				},
+			},
+			wantAddedFilesCount:    1,
+			wantDeletedFilesCount:  1,
+			wantModifiedFilesCount: 1,
+			wantRenamedFilesCount:  1,
+			targetProjectID:        10,
+			wantError:              false,
+			apiCallCount:           2,
+			diffAPILimitExceeded:   true,
 		},
 		{
 			name: "pull-request with wrong project ID",
@@ -985,6 +1440,7 @@ func TestGetFiles(t *testing.T) {
 			wantRenamedFilesCount:  0,
 			targetProjectID:        12,
 			wantError:              true,
+			apiCallCount:           1,
 		},
 		{
 			name: "push",
@@ -1016,65 +1472,69 @@ func TestGetFiles(t *testing.T) {
 			wantModifiedFilesCount: 1,
 			wantRenamedFilesCount:  1,
 			sourceProjectID:        0,
+			apiCallCount:           1,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			ctx, _ := rtesting.SetupFakeContext(t)
+			metricsutils.ResetMetrics()
 			fakeclient, mux, teardown := thelp.Setup(t)
 			defer teardown()
-			mergeFileChanges := []*gitlab.MergeRequestDiff{
-				{
-					NewPath: "modified.yaml",
-				},
-				{
-					NewPath: "added.doc",
-					NewFile: true,
-				},
-				{
-					NewPath:     "removed.yaml",
-					DeletedFile: true,
-				},
-				{
-					NewPath:     "renamed.doc",
-					RenamedFile: true,
-				},
-			}
+
 			if tt.event.TriggerTarget == "pull_request" {
+				mux.HandleFunc(fmt.Sprintf("/projects/10/merge_requests/%d", tt.event.PullRequestNumber),
+					func(rw http.ResponseWriter, _ *http.Request) {
+						resp := gitlab.MergeRequest{
+							ChangesCount: strconv.Itoa(len(tt.mrchanges)),
+						}
+						if tt.diffAPILimitExceeded {
+							resp.ChangesCount = strconv.Itoa(len(tt.mrchanges)-1) + "+"
+						}
+						jeez, err := json.Marshal(resp)
+						assert.NilError(t, err)
+						_, _ = rw.Write(jeez)
+					})
 				mux.HandleFunc(fmt.Sprintf("/projects/10/merge_requests/%d/diffs",
 					tt.event.PullRequestNumber), func(rw http.ResponseWriter, _ *http.Request) {
-					jeez, err := json.Marshal(mergeFileChanges)
+					diffAPIChanges := tt.mrchanges
+					if tt.diffAPILimitExceeded {
+						// The Diff API will not return the full list of files
+						diffAPIChanges = diffAPIChanges[:len(tt.mrchanges)-1]
+					}
+
+					jeez, err := json.Marshal(diffAPIChanges)
+					assert.NilError(t, err)
+					_, _ = rw.Write(jeez)
+				})
+				mux.HandleFunc("/projects/10/repository/compare", func(rw http.ResponseWriter, req *http.Request) {
+					if req.URL.Query().Get("from") != tt.event.BaseBranch || req.URL.Query().Get("to") != tt.event.SHA {
+						t.Errorf("expecting compare API call with 'from=%s&to=%s', got %s", tt.event.BaseBranch, tt.event.SHA, req.URL.Query().Encode())
+					}
+
+					// always return the full list, not subject to the Diff API size limitations
+					diffs := []*gitlab.Diff{}
+					for _, d := range tt.mrchanges {
+						diffs = append(diffs, &gitlab.Diff{NewPath: d.NewPath, NewFile: d.NewFile, RenamedFile: d.RenamedFile, DeletedFile: d.DeletedFile})
+					}
+					jeez, err := json.Marshal(gitlab.Compare{Diffs: diffs})
 					assert.NilError(t, err)
 					_, _ = rw.Write(jeez)
 				})
 			}
-			pushFileChanges := []*gitlab.Diff{
-				{
-					NewPath: "modified.yaml",
-				},
-				{
-					NewPath: "added.doc",
-					NewFile: true,
-				},
-				{
-					NewPath:     "removed.yaml",
-					DeletedFile: true,
-				},
-				{
-					NewPath:     "renamed.doc",
-					RenamedFile: true,
-				},
-			}
 			if tt.event.TriggerTarget == "push" {
 				mux.HandleFunc(fmt.Sprintf("/projects/0/repository/commits/%s/diff", tt.event.SHA),
 					func(rw http.ResponseWriter, _ *http.Request) {
-						jeez, err := json.Marshal(pushFileChanges)
+						jeez, err := json.Marshal(tt.pushChanges)
 						assert.NilError(t, err)
 						_, _ = rw.Write(jeez)
 					})
 			}
 
-			providerInfo := &Provider{gitlabClient: fakeclient, sourceProjectID: tt.sourceProjectID, targetProjectID: tt.targetProjectID}
+			metricsTags := map[string]string{"provider": "api.gitlab.com", "event-type": string(tt.event.TriggerTarget)}
+			metricstest.CheckStatsNotReported(t, "pipelines_as_code_git_provider_api_request_count")
+
+			providerInfo := &Provider{gitlabClient: fakeclient, sourceProjectID: int64(tt.sourceProjectID), targetProjectID: int64(tt.targetProjectID), triggerEvent: string(tt.event.TriggerTarget), apiURL: "api.gitlab.com"}
 			changedFiles, err := providerInfo.GetFiles(ctx, tt.event)
 			if tt.wantError != true {
 				assert.NilError(t, err, nil)
@@ -1094,6 +1554,96 @@ func TestGetFiles(t *testing.T) {
 					assert.Equal(t, tt.pushChanges[i].NewPath, changedFiles.All[i])
 				}
 			}
+
+			// Check caching
+			metricstest.CheckCountData(t, "pipelines_as_code_git_provider_api_request_count", metricsTags, tt.apiCallCount)
+			_, _ = providerInfo.GetFiles(ctx, tt.event)
+			if tt.wantError {
+				// No caching on error
+				metricstest.CheckCountData(t, "pipelines_as_code_git_provider_api_request_count", metricsTags, tt.apiCallCount*2)
+			} else {
+				// Cache API results on success
+				metricstest.CheckCountData(t, "pipelines_as_code_git_provider_api_request_count", metricsTags, tt.apiCallCount)
+			}
+		})
+	}
+}
+
+func TestGetFilesPaging(t *testing.T) {
+	tests := []struct {
+		name  string
+		event *info.Event
+	}{
+		{
+			name: "pull-request",
+			event: &info.Event{
+				TriggerTarget: "pull_request",
+				Organization:  "owner",
+				Repository:    "repository",
+			},
+		},
+		{
+			name: "push",
+			event: &info.Event{
+				TriggerTarget: "push",
+				Organization:  "owner",
+				Repository:    "repository",
+				SHA:           "shacommitinfo",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, _ := rtesting.SetupFakeContext(t)
+			metricsutils.ResetMetrics()
+			fakeclient, mux, teardown := thelp.Setup(t)
+			defer teardown()
+
+			changeCount := 5
+			apiCallCount := changeCount
+			if tt.event.TriggerTarget == "pull_request" {
+				// Extra request made to check the diff API limit
+				apiCallCount++
+			}
+
+			if tt.event.TriggerTarget == "pull_request" {
+				mux.HandleFunc(fmt.Sprintf("/projects/0/merge_requests/%d",
+					tt.event.PullRequestNumber), func(rw http.ResponseWriter, _ *http.Request) {
+					jeez, err := json.Marshal(gitlab.MergeRequest{ChangesCount: strconv.Itoa(changeCount)})
+					assert.NilError(t, err)
+					_, _ = rw.Write(jeez)
+				})
+				mux.HandleFunc(fmt.Sprintf("/projects/0/merge_requests/%d/diffs",
+					tt.event.PullRequestNumber), func(rw http.ResponseWriter, req *http.Request) {
+					pageCount := thelp.SetPagingHeader(t, rw, req, changeCount)
+					jeez, err := json.Marshal([]*gitlab.MergeRequestDiff{{NewPath: fmt.Sprintf("change-%d.txt", pageCount)}})
+					assert.NilError(t, err)
+					_, _ = rw.Write(jeez)
+				})
+			}
+			if tt.event.TriggerTarget == "push" {
+				mux.HandleFunc(fmt.Sprintf("/projects/0/repository/commits/%s/diff",
+					tt.event.SHA), func(rw http.ResponseWriter, req *http.Request) {
+					pageCount := thelp.SetPagingHeader(t, rw, req, changeCount)
+					jeez, err := json.Marshal([]*gitlab.Diff{{NewPath: fmt.Sprintf("change-%d.txt", pageCount)}})
+					assert.NilError(t, err)
+					_, _ = rw.Write(jeez)
+				})
+			}
+
+			metricsTags := map[string]string{"provider": "api.gitlab.com", "event-type": string(tt.event.TriggerTarget)}
+			metricstest.CheckStatsNotReported(t, "pipelines_as_code_git_provider_api_request_count")
+
+			providerInfo := &Provider{gitlabClient: fakeclient, sourceProjectID: 0, targetProjectID: 0, triggerEvent: string(tt.event.TriggerTarget), apiURL: "api.gitlab.com"}
+			changedFiles, err := providerInfo.GetFiles(ctx, tt.event)
+			assert.NilError(t, err, nil)
+			assert.DeepEqual(t, changedFiles.All, []string{"change-1.txt", "change-2.txt", "change-3.txt", "change-4.txt", "change-5.txt"})
+			assert.Equal(t, len(changedFiles.Modified), changeCount)
+
+			// Check caching
+			metricstest.CheckCountData(t, "pipelines_as_code_git_provider_api_request_count", metricsTags, int64(apiCallCount))
+			_, _ = providerInfo.GetFiles(ctx, tt.event)
+			metricstest.CheckCountData(t, "pipelines_as_code_git_provider_api_request_count", metricsTags, int64(apiCallCount))
 		})
 	}
 }
@@ -1210,9 +1760,12 @@ func TestGitLabCreateComment(t *testing.T) {
 			commit:       "Updated Comment",
 			updateMarker: "MARKER",
 			mockResponses: map[string]func(rw http.ResponseWriter, _ *http.Request){
+				"/user": func(rw http.ResponseWriter, _ *http.Request) {
+					fmt.Fprint(rw, `{"id": 100}`)
+				},
 				"/projects/666/merge_requests/123/notes": func(rw http.ResponseWriter, r *http.Request) {
 					if r.Method == http.MethodGet {
-						fmt.Fprint(rw, `[{"id": 555, "body": "MARKER"}]`)
+						fmt.Fprint(rw, `[{"id": 555, "body": "MARKER", "author": {"id": 100}}]`)
 						return
 					}
 				},
@@ -1229,14 +1782,41 @@ func TestGitLabCreateComment(t *testing.T) {
 			commit:       "New Comment",
 			updateMarker: "MARKER",
 			mockResponses: map[string]func(rw http.ResponseWriter, _ *http.Request){
+				"/user": func(rw http.ResponseWriter, _ *http.Request) {
+					fmt.Fprint(rw, `{"id": 100}`)
+				},
 				"/projects/666/merge_requests/123/notes": func(rw http.ResponseWriter, r *http.Request) {
 					if r.Method == http.MethodGet {
-						fmt.Fprint(rw, `[{"id": 555, "body": "NO_MATCH"}]`)
+						fmt.Fprint(rw, `[{"id": 555, "body": "NO_MATCH", "author": {"id": 200}}]`)
 						return
 					}
 					assert.Equal(t, r.Method, http.MethodPost)
 					rw.WriteHeader(http.StatusCreated)
 					fmt.Fprint(rw, `{}`)
+				},
+			},
+		},
+		{
+			name:         "skip comment from different user and create new",
+			event:        &info.Event{PullRequestNumber: 123, TargetProjectID: 666},
+			commit:       "Updated Comment",
+			updateMarker: "MARKER",
+			mockResponses: map[string]func(rw http.ResponseWriter, _ *http.Request){
+				"/user": func(rw http.ResponseWriter, _ *http.Request) {
+					fmt.Fprint(rw, `{"id": 100}`)
+				},
+				"/projects/666/merge_requests/123/notes": func(rw http.ResponseWriter, r *http.Request) {
+					if r.Method == http.MethodGet {
+						fmt.Fprint(rw, `[{"id": 555, "body": "Old MARKER", "author": {"id": 999}}]`)
+						return
+					}
+					assert.Equal(t, r.Method, http.MethodPost)
+					rw.WriteHeader(http.StatusCreated)
+					fmt.Fprint(rw, `{}`)
+				},
+				"/projects/666/merge_requests/123/notes/555": func(rw http.ResponseWriter, _ *http.Request) {
+					t.Error("edit endpoint should not be called for comment from different user")
+					rw.WriteHeader(http.StatusOK)
 				},
 			},
 		},
@@ -1266,6 +1846,7 @@ func TestGitLabCreateComment(t *testing.T) {
 			p := &Provider{
 				sourceProjectID: 666,
 				gitlabClient:    fakeclient,
+				Logger:          logger,
 			}
 			err := p.CreateComment(context.Background(), tt.event, tt.commit, tt.updateMarker)
 			if tt.wantErr != "" {
@@ -1275,4 +1856,57 @@ func TestGitLabCreateComment(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestGitLabCreateCommentPaging(t *testing.T) {
+	updated := false
+	event := &info.Event{PullRequestNumber: 123, TargetProjectID: 666}
+	commit := "Updated Comment"
+	updateMarker := "MARKER"
+	mockResponses := map[string]func(rw http.ResponseWriter, _ *http.Request){
+		"/user": func(rw http.ResponseWriter, _ *http.Request) {
+			fmt.Fprint(rw, `{"id": 100}`)
+		},
+		"/projects/666/merge_requests/123/notes": func(rw http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodGet {
+				page := thelp.SetPagingHeader(t, rw, r, 100)
+				note := "unrelated"
+				if page == 10 {
+					note = "MARKER"
+				} else if page > 10 {
+					t.Error("notes shouldn't be queries past the expected ID")
+				}
+				fmt.Fprintf(rw, `[{"id": %d, "body": "%s", "author": {"id": 100}}]`, page, note)
+			}
+		},
+		"/projects/666/merge_requests/123/notes/{id}": func(rw http.ResponseWriter, r *http.Request) {
+			assert.Equal(t, r.Method, "PUT")
+			if r.PathValue("id") == "10" {
+				rw.WriteHeader(http.StatusOK)
+				updated = true
+			} else {
+				rw.WriteHeader(http.StatusNotFound)
+				t.Errorf("note %s is not intended to be updated", r.PathValue("id"))
+			}
+			fmt.Fprint(rw, `{}`)
+		},
+	}
+
+	fakeclient, mux, teardown := thelp.Setup(t)
+	defer teardown()
+	observer, _ := zapobserver.New(zap.InfoLevel)
+	logger := zap.New(observer).Sugar()
+
+	for endpoint, handler := range mockResponses {
+		mux.HandleFunc(endpoint, handler)
+	}
+
+	p := &Provider{
+		sourceProjectID: 666,
+		gitlabClient:    fakeclient,
+		Logger:          logger,
+	}
+	err := p.CreateComment(context.Background(), event, commit, updateMarker)
+	assert.NilError(t, err)
+	assert.Assert(t, updated == true, "comment update handler has not been called")
 }
